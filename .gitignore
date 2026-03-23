@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+logos/
+logo.png
+style_guide.json
+.playwright-mcp/
