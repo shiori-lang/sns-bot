@@ -1,12 +1,15 @@
 """
 スタイル学習モジュール
-- 自分のInstagram・X投稿をAPIで取得
-- 競合URLからPlaywrightでスクレイピング
-- Claudeでスタイル分析 → style_guide.json に保存
+- 自分のInstagram・X投稿をAPIで取得（テキスト＋画像）
+- 競合URLからPlaywrightでスクレイピング（テキスト＋画像）
+- Claude Visionで画像スタイルを分析
+- Claudeでテキストスタイル分析 → style_guide.json に保存
 """
+import io
 import json
 import os
 import re
+import base64
 import asyncio
 import logging
 from pathlib import Path
@@ -14,6 +17,7 @@ from pathlib import Path
 import requests
 import tweepy
 import anthropic
+from PIL import Image
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -43,6 +47,7 @@ def load_style_guide() -> dict:
         "own_posts": {"instagram": [], "x": []},
         "reference_posts": [],
         "style_analysis": "",
+        "image_analysis": "",
         "caption_examples": {"instagram": [], "x": [], "line": []}
     }
 
@@ -55,22 +60,25 @@ def save_style_guide(guide: dict):
 # ════════════════════════════════════════════════════
 #  自分の投稿をAPIで取得
 # ════════════════════════════════════════════════════
-def fetch_own_instagram_posts(limit: int = 50) -> list[str]:
-    """Instagram Graph APIで自分の投稿キャプションを取得"""
+def fetch_own_instagram_posts(limit: int = 50) -> list[dict]:
+    """Instagram Graph APIで自分の投稿キャプションと画像URLを取得"""
     try:
         url = f"https://graph.instagram.com/v21.0/{INSTAGRAM_USER_ID}/media"
         r = requests.get(url, params={
-            "fields": "caption,media_type,timestamp",
+            "fields": "caption,media_type,timestamp,media_url",
             "limit": limit,
             "access_token": INSTAGRAM_ACCESS_TOKEN
         })
         data = r.json().get("data", [])
-        captions = [
-            d["caption"] for d in data
-            if d.get("caption") and d.get("media_type") in ("IMAGE", "CAROUSEL_ALBUM")
-        ]
-        logger.info(f"Instagram: {len(captions)}件取得")
-        return captions
+        posts = []
+        for d in data:
+            if d.get("media_type") in ("IMAGE", "CAROUSEL_ALBUM"):
+                posts.append({
+                    "caption":   d.get("caption", ""),
+                    "image_url": d.get("media_url", ""),
+                })
+        logger.info(f"Instagram: {len(posts)}件取得")
+        return posts
     except Exception as e:
         logger.error(f"Instagram取得エラー: {e}")
         return []
@@ -105,13 +113,37 @@ def fetch_own_x_posts(limit: int = 100) -> list[str]:
         return []
 
 # ════════════════════════════════════════════════════
+#  画像ダウンロード
+# ════════════════════════════════════════════════════
+def _download_image(url: str) -> bytes | None:
+    """URLから画像をダウンロード。失敗したらNone"""
+    if not url:
+        return None
+    try:
+        r = requests.get(url, timeout=10,
+                         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        if r.status_code == 200 and "image" in r.headers.get("Content-Type", ""):
+            return r.content
+    except Exception as e:
+        logger.warning(f"画像DL失敗 ({url[:60]}): {e}")
+    return None
+
+def _prepare_image_for_vision(img_bytes: bytes) -> str:
+    """画像をClaude Vision用のbase64文字列に変換（800px以下にリサイズ）"""
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    img.thumbnail((800, 800), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80)
+    return base64.b64encode(buf.getvalue()).decode()
+
+# ════════════════════════════════════════════════════
 #  競合URLからスクレイピング（Playwright）
 # ════════════════════════════════════════════════════
-async def scrape_url(url: str) -> list[str]:
-    """URLからSNS投稿テキストを抽出"""
+async def scrape_url(url: str) -> list[dict]:
+    """URLからSNS投稿テキストと画像URLを抽出。list[{"text": str, "image_url": str}]を返す"""
     from playwright.async_api import async_playwright
 
-    texts = []
+    posts = []
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
@@ -121,94 +153,150 @@ async def scrape_url(url: str) -> list[str]:
             await page.goto(url, timeout=30000, wait_until="domcontentloaded")
             await page.wait_for_timeout(3000)
 
-            # Instagram投稿
             if "instagram.com" in url:
-                texts = await _scrape_instagram(page, url)
-            # X/Twitter投稿
+                posts = await _scrape_instagram(page, url)
             elif "x.com" in url or "twitter.com" in url:
-                texts = await _scrape_x(page, url)
-            # その他（汎用）
+                posts = await _scrape_x(page, url)
             else:
-                texts = await _scrape_generic(page)
+                posts = await _scrape_generic(page)
 
             await browser.close()
     except Exception as e:
         logger.error(f"スクレイピングエラー ({url}): {e}")
-    return texts
+    return posts
 
 
-async def _scrape_instagram(page, url: str) -> list[str]:
-    """Instagramページから投稿テキストを取得"""
-    texts = []
+async def _scrape_instagram(page, url: str) -> list[dict]:
+    """Instagramページから投稿テキストと画像URLを取得"""
+    posts = []
     try:
         if "/p/" in url or "/reel/" in url:
             # 個別投稿
-            el = await page.query_selector("meta[property='og:description']")
-            if el:
-                content = await el.get_attribute("content")
-                if content:
-                    texts.append(content)
+            text_el = await page.query_selector("meta[property='og:description']")
+            img_el  = await page.query_selector("meta[property='og:image']")
+            text      = (await text_el.get_attribute("content") or "") if text_el else ""
+            image_url = (await img_el.get_attribute("content")  or "") if img_el  else ""
+            if text or image_url:
+                posts.append({"text": text, "image_url": image_url})
         else:
-            # プロフィールページ → 複数投稿のキャプションをmeta descriptionから取得
-            # リンクをクリックして各投稿を見ることは難しいためOGPで対応
-            els = await page.query_selector_all("article")
-            for el in els[:10]:
-                text = await el.inner_text()
-                if text.strip():
-                    texts.append(text.strip()[:300])
+            # プロフィールページ
+            articles = await page.query_selector_all("article")
+            for article in articles[:10]:
+                text = (await article.inner_text()).strip()[:300]
+                img  = await article.query_selector("img")
+                image_url = (await img.get_attribute("src") or "") if img else ""
+                # og:image フォールバック
+                if not image_url:
+                    og = await page.query_selector("meta[property='og:image']")
+                    if og:
+                        image_url = await og.get_attribute("content") or ""
+                if text or image_url:
+                    posts.append({"text": text, "image_url": image_url})
     except Exception as e:
         logger.error(f"Instagram scrape error: {e}")
-    return texts
+    return posts
 
 
-async def _scrape_x(page, url: str) -> list[str]:
-    """X(Twitter)から投稿テキストを取得"""
-    texts = []
+async def _scrape_x(page, url: str) -> list[dict]:
+    """X(Twitter)から投稿テキストと画像URLを取得"""
+    posts = []
     try:
         if "/status/" in url:
-            # 個別ツイート
             await page.wait_for_selector('[data-testid="tweetText"]', timeout=10000)
-            els = await page.query_selector_all('[data-testid="tweetText"]')
-            for el in els[:1]:
-                texts.append(await el.inner_text())
+            text_els = await page.query_selector_all('[data-testid="tweetText"]')
+            img_els  = await page.query_selector_all('[data-testid="tweetPhoto"] img')
+            text      = (await text_els[0].inner_text()) if text_els else ""
+            image_url = (await img_els[0].get_attribute("src") or "") if img_els else ""
+            if text or image_url:
+                posts.append({"text": text, "image_url": image_url})
         else:
-            # プロフィールページ → 最新ツイートを取得
             await page.wait_for_selector('[data-testid="tweetText"]', timeout=15000)
-            els = await page.query_selector_all('[data-testid="tweetText"]')
-            for el in els[:20]:
-                t = await el.inner_text()
-                if t.strip():
-                    texts.append(t.strip())
+            text_els    = await page.query_selector_all('[data-testid="tweetText"]')
+            img_els_all = await page.query_selector_all('[data-testid="tweetPhoto"] img')
+            for i, el in enumerate(text_els[:20]):
+                t = (await el.inner_text()).strip()
+                image_url = ""
+                if i < len(img_els_all):
+                    image_url = await img_els_all[i].get_attribute("src") or ""
+                if t or image_url:
+                    posts.append({"text": t, "image_url": image_url})
     except Exception as e:
         logger.error(f"X scrape error: {e}")
-    return texts
+    return posts
 
 
-async def _scrape_generic(page) -> list[str]:
+async def _scrape_generic(page) -> list[dict]:
     """汎用ページからテキスト抽出"""
     try:
         body = await page.inner_text("body")
-        # 長すぎる場合は先頭3000文字
-        return [body[:3000]]
+        return [{"text": body[:3000], "image_url": ""}]
     except Exception:
         return []
 
 # ════════════════════════════════════════════════════
-#  Claudeでスタイル分析
+#  Claude Vision で画像スタイルを分析
+# ════════════════════════════════════════════════════
+def analyze_images_style(image_bytes_list: list[bytes], source_desc: str) -> str:
+    """画像リストをClaude Visionで分析してビジュアルスタイルを返す"""
+    if not image_bytes_list:
+        return ""
+
+    content = []
+    for img_bytes in image_bytes_list[:10]:  # 最大10枚
+        try:
+            b64 = _prepare_image_for_vision(img_bytes)
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}
+            })
+        except Exception as e:
+            logger.warning(f"画像変換エラー: {e}")
+
+    if not content:
+        return ""
+
+    content.append({
+        "type": "text",
+        "text": f"""これらは{source_desc}のSNS投稿画像です。
+以下の観点で画像スタイルを分析し、今後の投稿画像作成に活かせるガイドを作成してください:
+
+1. 色調・カラーパレット（温かみ・クール・明るい・鮮やか・落ち着いたなど）
+2. 構図・レイアウト（クローズアップ・俯瞰・整然・にぎやかなど）
+3. 照明・雰囲気（自然光・スタジオ光・明るい・ドラマチックなど）
+4. 被写体の傾向（商品メイン・人物・店内・料理・価格POP等）
+5. 全体の世界観（高級感・親しみやすい・元気・清潔感など）
+
+100〜200文字でまとめてください。"""
+    })
+
+    result = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=400,
+        messages=[{"role": "user", "content": content}]
+    )
+    return result.content[0].text.strip()
+
+# ════════════════════════════════════════════════════
+#  Claudeでテキストスタイル分析
 # ════════════════════════════════════════════════════
 def analyze_style(posts: dict) -> str:
-    """投稿例からスタイルを分析"""
+    """投稿例（テキスト＋画像分析）からスタイルを分析"""
     own_insta  = posts.get("own_instagram", [])
     own_x      = posts.get("own_x", [])
     refs       = posts.get("reference", [])
+    image_analysis = posts.get("image_analysis", "")
 
     sample_own_insta = "\n---\n".join(own_insta[:10])
     sample_own_x     = "\n---\n".join(own_x[:10])
-    sample_refs      = "\n---\n".join([r["text"] for r in refs[:10]])
+    sample_refs      = "\n---\n".join([r["text"] for r in refs[:10] if r.get("text")])
+
+    image_section = ""
+    if image_analysis:
+        image_section = f"\n【画像スタイル分析（Vision）】\n{image_analysis}\n"
 
     prompt = f"""スーパー「みどりのマート」のSNS投稿スタイルを分析してください。
 
-【自分のInstagram投稿例】
+【自分のInstagram投稿例（テキスト）】
 {sample_own_insta or '（なし）'}
 
 【自分のX(Twitter)投稿例】
@@ -216,14 +304,15 @@ def analyze_style(posts: dict) -> str:
 
 【参考にする競合・参考アカウントの投稿例】
 {sample_refs or '（なし）'}
-
+{image_section}
 以下の観点で分析し、今後のキャプション生成に使えるスタイルガイドを作成してください：
 1. 文体・トーン（丁寧語・タメ口・親しみやすさなど）
 2. よく使う表現・フレーズ
 3. 絵文字の使い方
 4. ハッシュタグの傾向
 5. 投稿の構成パターン
-6. 競合との差別化ポイント
+6. ビジュアルスタイルの特徴（画像分析を反映）
+7. 競合との差別化ポイント
 
 日本語で200〜400文字程度でまとめてください。"""
 
@@ -242,8 +331,12 @@ async def run_learn_own_posts() -> tuple[int, int, str, str]:
     guide = load_style_guide()
     warning = ""
 
+    # Instagram: テキスト＋画像URL
     insta_posts = fetch_own_instagram_posts(50)
+    insta_captions  = [p["caption"]   for p in insta_posts if p.get("caption")]
+    insta_img_urls  = [p["image_url"] for p in insta_posts if p.get("image_url")]
 
+    # X: テキストのみ
     x_posts = []
     try:
         x_posts = fetch_own_x_posts(100)
@@ -255,40 +348,93 @@ async def run_learn_own_posts() -> tuple[int, int, str, str]:
     except Exception as e:
         logger.error(f"X取得エラー: {e}")
 
-    guide["own_posts"]["instagram"] = insta_posts
+    # 自分のInstagram画像をダウンロードしてVisionで分析
+    logger.info(f"Instagram画像 {len(insta_img_urls)}件をダウンロード中...")
+    insta_images = []
+    for url in insta_img_urls[:10]:
+        img = _download_image(url)
+        if img:
+            insta_images.append(img)
+
+    image_analysis = ""
+    if insta_images:
+        logger.info(f"{len(insta_images)}枚の画像をVisionで分析中...")
+        image_analysis = analyze_images_style(insta_images, "自分のInstagram")
+
+    # 参考投稿の画像も追加分析
+    ref_images = []
+    for ref in guide.get("reference_posts", [])[:10]:
+        if ref.get("image_url"):
+            img = _download_image(ref["image_url"])
+            if img:
+                ref_images.append(img)
+    if ref_images:
+        ref_analysis = analyze_images_style(ref_images, "参考アカウント")
+        if ref_analysis:
+            image_analysis = f"【自分の投稿】{image_analysis}\n【参考アカウント】{ref_analysis}" if image_analysis else ref_analysis
+
+    guide["own_posts"]["instagram"] = insta_captions
     if x_posts:
         guide["own_posts"]["x"] = x_posts
+    guide["image_analysis"] = image_analysis
 
     analysis = analyze_style({
-        "own_instagram": insta_posts,
-        "own_x": x_posts,
-        "reference": guide.get("reference_posts", [])
+        "own_instagram":  insta_captions,
+        "own_x":          x_posts,
+        "reference":      guide.get("reference_posts", []),
+        "image_analysis": image_analysis,
     })
     guide["style_analysis"] = analysis
     save_style_guide(guide)
 
-    return len(insta_posts), len(x_posts), analysis, warning
+    return len(insta_captions), len(x_posts), analysis, warning
 
 
 async def run_learn_url(url: str) -> tuple[int, str]:
     """URLから投稿を取得・分析して保存。(件数, 分析結果) を返す"""
     guide = load_style_guide()
 
-    texts = await scrape_url(url)
-    if not texts:
+    posts = await scrape_url(url)
+    if not posts:
         return 0, ""
 
     # 参考投稿に追加
-    for t in texts:
-        guide["reference_posts"].append({"source": url, "text": t})
+    for p in posts:
+        guide["reference_posts"].append({
+            "source":    url,
+            "text":      p.get("text", ""),
+            "image_url": p.get("image_url", ""),
+        })
+
+    # 取得した画像をVisionで分析
+    image_urls = [p["image_url"] for p in posts if p.get("image_url")]
+    images = []
+    for img_url in image_urls[:10]:
+        img = _download_image(img_url)
+        if img:
+            images.append(img)
+
+    url_image_analysis = ""
+    if images:
+        logger.info(f"{len(images)}枚の競合画像をVisionで分析中...")
+        url_image_analysis = analyze_images_style(images, f"{url}の投稿")
+
+    # 既存の画像分析と統合
+    existing_img = guide.get("image_analysis", "")
+    if url_image_analysis:
+        if existing_img:
+            guide["image_analysis"] = f"{existing_img}\n【{url}】{url_image_analysis}"
+        else:
+            guide["image_analysis"] = url_image_analysis
 
     # 全データで再分析
     analysis = analyze_style({
-        "own_instagram": guide["own_posts"].get("instagram", []),
-        "own_x": guide["own_posts"].get("x", []),
-        "reference": guide.get("reference_posts", [])
+        "own_instagram":  guide["own_posts"].get("instagram", []),
+        "own_x":          guide["own_posts"].get("x", []),
+        "reference":      guide.get("reference_posts", []),
+        "image_analysis": guide.get("image_analysis", ""),
     })
     guide["style_analysis"] = analysis
     save_style_guide(guide)
 
-    return len(texts), analysis
+    return len(posts), analysis

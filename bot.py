@@ -287,13 +287,16 @@ def generate_caption(instruction: str, platform: str) -> str:
 
     # スタイルガイドを読み込む
     guide = load_style_guide()
-    style_analysis = guide.get("style_analysis", "")
+    style_analysis  = guide.get("style_analysis", "")
+    image_analysis  = guide.get("image_analysis", "")
     examples = guide.get("own_posts", {}).get(platform, [])[:3]
     example_text = "\n---\n".join(examples) if examples else ""
 
     style_section = ""
     if style_analysis:
         style_section = f"\n【学習済みスタイルガイド】\n{style_analysis}\n"
+    if image_analysis:
+        style_section += f"\n【画像スタイルの傾向（この雰囲気に合うキャプションを）】\n{image_analysis}\n"
     if example_text:
         style_section += f"\n【過去の投稿例（このスタイルを参考に）】\n{example_text}\n"
 
