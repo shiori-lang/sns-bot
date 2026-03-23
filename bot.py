@@ -834,19 +834,19 @@ async def learn_own_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         insta_count, x_count, analysis, warning = await run_learn_own_posts()
         x_status = f"{x_count}件" if x_count else "⚠️ クレジット不足（後で追加可）"
-        result_text = (
+        header = (
             f"✅ 学習完了！\n\n"
             f"📸 Instagram: {insta_count}件\n"
-            f"🐦 X: {x_status}\n\n"
-            f"📊 *スタイル分析結果:*\n{analysis}"
+            f"🐦 X: {x_status}"
         )
         if warning == "x_credit":
-            result_text += (
-                "\n\n⚠️ *Xのクレジットが不足しています*\n"
+            header += (
+                "\n\n⚠️ Xのクレジットが不足しています\n"
                 "X Developer Console でクレジットを追加すると\n"
                 "Xの過去投稿も学習できます。"
             )
-        await msg.reply_text(result_text, parse_mode="Markdown")
+        await msg.reply_text(header)
+        await msg.reply_text(f"📊 スタイル分析結果:\n\n{analysis}")
     except Exception as e:
         logger.error(f"学習エラー: {e}")
         await msg.reply_text(f"❌ エラー: {e}")
@@ -869,11 +869,8 @@ async def learn_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if count == 0:
             await msg.reply_text("❌ 投稿を取得できませんでした。URLを確認してください。")
             return
-        await msg.reply_text(
-            f"✅ 参考投稿 {count}件 を学習しました！\n\n"
-            f"📊 *更新されたスタイル分析:*\n{analysis}",
-            parse_mode="Markdown"
-        )
+        await msg.reply_text(f"✅ 参考投稿 {count}件 を学習しました！")
+        await msg.reply_text(f"📊 更新されたスタイル分析:\n\n{analysis}")
     except Exception as e:
         logger.error(f"URL学習エラー: {e}")
         await msg.reply_text(f"❌ エラー: {e}")
