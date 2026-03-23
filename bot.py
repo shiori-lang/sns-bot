@@ -415,12 +415,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # ── プレビュー後の修正指示を自然言語で処理 ──────────────────
+    pending_key = context.bot_data.get(f"pending_chat_{msg.chat_id}")
+    if pending_key and pending_key in context.bot_data and not msg.photo:
+        pending = context.bot_data[pending_key]
+        await _handle_modification(msg, context, user_text, pending, pending_key)
+        return
+
     await msg.reply_text("🤖 指示を解析中...")
 
     # 指示解析
     parsed = parse_instruction(user_text)
     platforms        = parsed.get("platforms", ["instagram", "x"])
-    do_add_logo      = parsed.get("add_logo", False)
+    do_add_logo      = parsed.get("add_logo", True)
     do_generate      = parsed.get("generate_image", False)
     image_prompt     = parsed.get("image_prompt", "")
     caption_instr    = parsed.get("caption_instruction", user_text)
@@ -450,7 +457,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ロゴ合成（デフォルトで常に入れる。「ロゴなし」指示の場合のみスキップ）
     if do_add_logo:
-        if LOGO_PATH.exists():
+        logos = get_logo_paths()
+        if logos:
             image_bytes = add_logo_to_image(image_bytes)
         else:
             await msg.reply_text(
@@ -461,13 +469,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("✍️ キャプション生成中...")
     captions = {p: generate_caption(caption_instr, p) for p in platforms}
 
-    # プレビュー表示
-    platform_emoji = {"instagram": "📸", "x": "🐦", "line": "💚"}
-    preview_lines = ["📋 *投稿プレビュー*\n"]
-    for p in platforms:
-        emoji = platform_emoji.get(p, "")
-        preview_lines.append(f"{emoji} *{p.upper()}*\n{captions[p]}\n")
+    await _send_preview(msg, context, image_bytes, captions, platforms, image_prompt, caption_instr, do_add_logo)
 
+
+async def _send_preview(msg, context, image_bytes, captions, platforms, image_prompt="", caption_instr="", do_add_logo=True):
+    """プレビュー画像とキャプションを送信"""
     # データ保存
     key = f"pending_{msg.chat_id}_{msg.message_id}"
     context.bot_data[key] = {
@@ -476,14 +482,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "platforms": platforms,
         "chat_id": msg.chat_id,
         "message_id": msg.message_id,
+        "image_prompt": image_prompt,
+        "caption_instr": caption_instr,
+        "do_add_logo": do_add_logo,
     }
+    # 最新のpendingを記録（修正フロー用）
+    context.bot_data[f"pending_chat_{msg.chat_id}"] = key
 
-    # 画像プレビュー送信
+    platform_emoji = {"instagram": "📸", "x": "🐦", "line": "💚"}
+    preview_lines = ["📋 *投稿プレビュー*\n"]
+    for p in platforms:
+        emoji = platform_emoji.get(p, "")
+        preview_lines.append(f"{emoji} *{p.upper()}*\n{captions[p]}\n")
+    preview_lines.append("_返信で修正指示を送ることもできます_")
+
     await msg.reply_photo(photo=io.BytesIO(image_bytes))
-
     keyboard = [
         [InlineKeyboardButton("✅ 投稿する", callback_data=f"post_{msg.chat_id}_{msg.message_id}")],
-        [InlineKeyboardButton("✏️ キャプション書き直し", callback_data=f"rewrite_{msg.chat_id}_{msg.message_id}")],
         [InlineKeyboardButton("❌ キャンセル", callback_data=f"cancel_{msg.chat_id}_{msg.message_id}")],
     ]
     await msg.reply_text(
@@ -491,6 +506,61 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
+
+async def _handle_modification(msg, context, user_text: str, pending: dict, pending_key: str):
+    """プレビュー後の自然言語修正指示を処理"""
+    await msg.reply_text("🤖 修正内容を解析中...")
+
+    image_prompt   = pending.get("image_prompt", "")
+    caption_instr  = pending.get("caption_instr", "")
+    platforms      = pending.get("platforms", ["instagram", "x"])
+    do_add_logo    = pending.get("do_add_logo", True)
+    image_bytes    = pending.get("image_bytes")
+
+    # Claudeで修正種別を判定
+    result = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=256,
+        messages=[{"role": "user", "content": f"""以下の修正指示がSNS投稿の「画像」「キャプション」「両方」のどれに関するものかを判定してください。
+
+修正指示: {user_text}
+
+JSONのみ返してください:
+{{"target": "image" or "caption" or "both", "image_note": "画像への追加指示", "caption_note": "キャプションへの追加指示"}}"""}]
+    )
+    try:
+        text = result.content[0].text.strip()
+        text = re.sub(r"```json|```", "", text).strip()
+        mod = json.loads(text)
+    except Exception:
+        mod = {"target": "both", "image_note": user_text, "caption_note": user_text}
+
+    target = mod.get("target", "both")
+
+    # 画像を修正
+    if target in ("image", "both") and image_prompt:
+        new_prompt = f"{image_prompt}。修正: {mod.get('image_note', user_text)}"
+        await msg.reply_text("🎨 画像を再生成中...")
+        new_image = await generate_image_gemini(new_prompt)
+        if new_image:
+            if do_add_logo and get_logo_paths():
+                new_image = add_logo_to_image(new_image)
+            image_bytes = new_image
+            image_prompt = new_prompt
+
+    # キャプションを修正
+    if target in ("caption", "both"):
+        new_instr = f"{caption_instr}。修正: {mod.get('caption_note', user_text)}"
+        await msg.reply_text("✍️ キャプション修正中...")
+        captions = {p: generate_caption(new_instr, p) for p in platforms}
+        caption_instr = new_instr
+    else:
+        captions = pending.get("captions", {})
+
+    # 古いpendingを削除して新しいプレビューを表示
+    del context.bot_data[pending_key]
+    await _send_preview(msg, context, image_bytes, captions, platforms, image_prompt, caption_instr, do_add_logo)
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -508,11 +578,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await execute_posting(context, int(chat_id), int(msg_id))
         return
 
+    if data.startswith("editimg_"):
+        _, chat_id, msg_id = data.split("_", 2)
+        context.bot_data[f"editimg_{chat_id}_{msg_id}"] = True
+        await query.edit_message_text(
+            "🎨 どう修正しますか？修正内容を送ってください。\n"
+            "例: `もっと明るい雰囲気にして` / `背景を白にして` / `野菜を大きく映して`"
+        )
+        return
+
     if data.startswith("rewrite_"):
         _, chat_id, msg_id = data.split("_", 2)
         context.bot_data[f"rewrite_{chat_id}_{msg_id}"] = True
         await query.edit_message_text(
-            "📝 新しい指示を送ってください（@メンションで）："
+            "📝 新しいキャプション指示を送ってください："
         )
         return
 
