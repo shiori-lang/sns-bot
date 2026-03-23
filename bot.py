@@ -405,10 +405,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = raw_text.replace(f"@{bot_username}", "").strip()
 
     if not user_text:
-        await msg.reply_text(
-            "📝 指示を一緒に送ってください。\n例: `@bot この写真でインスタとXに投稿して。お題は新鮮なイチゴの特売`",
-            parse_mode="Markdown"
-        )
+        # テキストなしで写真だけ → ロゴ登録として扱う
+        if msg.photo:
+            await _save_logo(msg)
+        else:
+            await msg.reply_text(
+                "📝 指示を一緒に送ってください。\n例: `@bot この写真でインスタとXに投稿して。お題は新鮮なイチゴの特売`",
+                parse_mode="Markdown"
+            )
         return
 
     await msg.reply_text("🤖 指示を解析中...")
