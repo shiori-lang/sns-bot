@@ -425,22 +425,23 @@ async def execute_scheduled_post(context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text="📅 *予約投稿 完了*\n\n" + "\n".join(results),
-        parse_mode="Markdown"
+        text="📅 予約投稿 完了\n\n" + "\n".join(results)
     )
 
 
 async def execute_posting(context: ContextTypes.DEFAULT_TYPE,
                            chat_id: int, message_id: int):
-    data      = context.bot_data.get(f"pending_{chat_id}_{message_id}", {})
-    image_bytes = data.get("image_bytes")
-    captions    = data.get("captions", {})
-    platforms   = data.get("platforms", [])
+    pending_key  = f"pending_{chat_id}_{message_id}"
+    data         = context.bot_data.get(pending_key, {})
+    image_bytes  = data.get("image_bytes")
+    sized_images = data.get("sized_images", {})
+    captions     = data.get("captions", {})
+    platforms    = data.get("platforms", [])
 
     results = []
     for p in platforms:
         caption = captions.get(p, "")
-        sized = resize_for_platform(image_bytes, p)
+        sized = sized_images.get(p) or resize_for_platform(image_bytes, p)
         if p == "instagram":
             ok = post_instagram(sized, caption)
             results.append(f"📸 Instagram: {'✅ 成功' if ok else '❌ 失敗'}")
@@ -451,10 +452,13 @@ async def execute_posting(context: ContextTypes.DEFAULT_TYPE,
             ok = post_line(sized, caption)
             results.append(f"💚 LINE: {'✅ 成功' if ok else '❌ 失敗'}")
 
+    # bot_data を掃除
+    context.bot_data.pop(pending_key, None)
+    context.bot_data.pop(f"pending_chat_{chat_id}", None)
+
     await context.bot.send_message(
         chat_id=chat_id,
-        text="📊 *投稿結果*\n\n" + "\n".join(results),
-        parse_mode="Markdown"
+        text="📊 投稿結果\n\n" + "\n".join(results)
     )
 
 # ════════════════════════════════════════════════════
@@ -473,13 +477,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    # ロゴ登録待機中なら写真をロゴとして保存
-    if context.user_data.get("waiting_logo") and msg.photo:
-        context.user_data["waiting_logo"] = False
-        await _save_logo(msg)
-        return
-
-    # グループでは @メンション か リプライのみ反応
+    # グループでは @メンション か リプライのみ反応（ロゴ登録含め全処理をスキップ）
     if msg.chat.type in ("group", "supergroup"):
         bot_username = await get_bot_username(context)
         mentioned = (
@@ -490,9 +488,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg.reply_to_message and
             msg.reply_to_message.from_user and
             msg.reply_to_message.from_user.username == bot_username
-        )
+        ) or context.user_data.get("waiting_logo")  # /setlogo 待機中は写真を受け付ける
         if not mentioned:
             return
+
+    # ロゴ登録待機中なら写真をロゴとして保存
+    if context.user_data.get("waiting_logo") and msg.photo:
+        context.user_data["waiting_logo"] = False
+        await _save_logo(msg)
+        return
 
     # テキスト取得（caption or text）
     raw_text = msg.caption or msg.text or ""
@@ -501,19 +505,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = raw_text.replace(f"@{bot_username}", "").strip()
 
     if not user_text:
-        # テキストなしで写真だけ → ロゴ登録として扱う
+        # テキストなしで写真だけ → ロゴ登録として扱う（DM のみ。グループは /setlogo 待機中のみここに来る）
         if msg.photo:
             await _save_logo(msg)
         else:
             await msg.reply_text(
-                "📝 指示を一緒に送ってください。\n例: `@bot この写真でインスタとXに投稿して。お題は新鮮なイチゴの特売`",
-                parse_mode="Markdown"
+                "📝 指示を一緒に送ってください。\n例: この写真でインスタとXに投稿して。お題は新鮮なイチゴの特売"
             )
         return
 
     # ── 予約投稿の日時入力待ち ──────────────────────────────
     ws_key = context.bot_data.get(f"waiting_schedule_{msg.chat_id}")
     if ws_key and not msg.photo:
+        # キャンセル
+        if user_text.strip() in ("キャンセル", "cancel", "Cancel"):
+            del context.bot_data[f"waiting_schedule_{msg.chat_id}"]
+            await msg.reply_text("予約入力をキャンセルしました。")
+            return
         pending = context.bot_data.get(ws_key)
         if pending:
             # 既に検出済みの schedule_time をそのまま使う or 新しく解析
@@ -525,8 +533,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not iso_time:
                 await msg.reply_text(
                     "⏰ 日時を読み取れませんでした。もう一度入力してください。\n"
-                    "例: `明日の朝9時` / `3月25日 14:00`",
-                    parse_mode="Markdown"
+                    "例: 明日の朝9時 / 3月25日 14:00\n「キャンセル」で中止"
                 )
                 return
 
@@ -616,49 +623,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _send_preview(msg, context, image_bytes, captions, platforms,
                         image_prompt="", caption_instr="", do_add_logo=True, schedule_time=""):
-    """プレビュー画像とキャプションを送信"""
-    # データ保存
-    key = f"pending_{msg.chat_id}_{msg.message_id}"
-    context.bot_data[key] = {
-        "image_bytes": image_bytes,
-        "captions": captions,
-        "platforms": platforms,
-        "chat_id": msg.chat_id,
-        "message_id": msg.message_id,
-        "image_prompt": image_prompt,
-        "caption_instr": caption_instr,
-        "do_add_logo": do_add_logo,
-        "schedule_time": schedule_time,
-    }
-    # 最新のpendingを記録（修正フロー用）
-    context.bot_data[f"pending_chat_{msg.chat_id}"] = key
-
+    """プレビュー画像とキャプションを送信（各プラットフォームのリサイズ済み画像を表示）"""
     platform_emoji = {"instagram": "📸", "x": "🐦", "line": "💚"}
     platform_sizes = {"instagram": "1080×1080", "x": "1200×675", "line": "1040×1040"}
-    preview_lines = ["📋 *投稿プレビュー*\n"]
+
+    # 各プラットフォーム向けにリサイズ（見たまま投稿）
+    sized_images = {p: resize_for_platform(image_bytes, p) for p in platforms}
+
+    key = f"pending_{msg.chat_id}_{msg.message_id}"
+    context.bot_data[key] = {
+        "image_bytes":  image_bytes,    # 元画像（修正再生成用）
+        "sized_images": sized_images,   # リサイズ済み（投稿用）
+        "captions":     captions,
+        "platforms":    platforms,
+        "chat_id":      msg.chat_id,
+        "message_id":   msg.message_id,
+        "image_prompt": image_prompt,
+        "caption_instr": caption_instr,
+        "do_add_logo":  do_add_logo,
+        "schedule_time": schedule_time,
+    }
+    context.bot_data[f"pending_chat_{msg.chat_id}"] = key
+
+    # 各プラットフォームのリサイズ済み画像を1枚ずつ送信
     for p in platforms:
         emoji = platform_emoji.get(p, "")
-        size = platform_sizes.get(p, "")
-        preview_lines.append(f"{emoji} *{p.upper()}* `{size}`\n{captions[p]}\n")
+        size  = platform_sizes.get(p, "")
+        await msg.reply_photo(
+            photo=io.BytesIO(sized_images[p]),
+            caption=f"{emoji} {p.upper()}  {size}"
+        )
+
+    # キャプション＋ボタン（parse_mode なし ← Claude生成テキストが含まれるため）
+    caption_lines = ["📋 投稿プレビュー\n"]
+    for p in platforms:
+        emoji = platform_emoji.get(p, "")
+        caption_lines.append(f"{emoji} {p.upper()}\n{captions[p]}\n")
 
     if schedule_time:
         try:
             dt = datetime.fromisoformat(schedule_time)
-            preview_lines.append(f"⏰ *検出された投稿時刻:* {dt.strftime('%Y年%m月%d日 %H:%M')}")
+            caption_lines.append(f"⏰ 検出された投稿時刻: {dt.strftime('%Y年%m月%d日 %H:%M')}")
         except Exception:
             pass
 
-    preview_lines.append("_返信で修正指示を送ることもできます_")
+    caption_lines.append("返信で修正指示を送ることもできます")
 
-    await msg.reply_photo(photo=io.BytesIO(image_bytes))
     keyboard = [
-        [InlineKeyboardButton("✅ 今すぐ投稿", callback_data=f"post_{msg.chat_id}_{msg.message_id}")],
-        [InlineKeyboardButton("⏰ 予約投稿", callback_data=f"schedule_{msg.chat_id}_{msg.message_id}")],
-        [InlineKeyboardButton("❌ キャンセル", callback_data=f"cancel_{msg.chat_id}_{msg.message_id}")],
+        [InlineKeyboardButton("✅ 今すぐ投稿",  callback_data=f"post_{msg.chat_id}_{msg.message_id}")],
+        [InlineKeyboardButton("⏰ 予約投稿",    callback_data=f"schedule_{msg.chat_id}_{msg.message_id}")],
+        [InlineKeyboardButton("❌ キャンセル",  callback_data=f"cancel_{msg.chat_id}_{msg.message_id}")],
     ]
     await msg.reply_text(
-        "\n".join(preview_lines),
-        parse_mode="Markdown",
+        "\n".join(caption_lines),
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
