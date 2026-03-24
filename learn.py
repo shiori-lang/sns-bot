@@ -509,7 +509,7 @@ async def run_learn_url(url: str) -> tuple[int, str]:
 
     posts = await scrape_url(url)
     if not posts:
-        return 0, ""
+        return 0, 0, "", ""
 
     # 参考投稿に追加
     for p in posts:
