@@ -25,7 +25,7 @@ import google.generativeai as genai
 import anthropic
 import tweepy
 from PIL import Image, ImageDraw
-from learn import run_learn_own_posts, run_learn_url, load_style_guide
+from learn import run_learn_own_posts, run_learn_url, run_learn_images, load_style_guide
 
 load_dotenv()
 
@@ -498,8 +498,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg.reply_to_message and
             msg.reply_to_message.from_user and
             msg.reply_to_message.from_user.username == bot_username
-        ) or context.user_data.get("waiting_logo")  # /setlogo 待機中は写真を受け付ける
+        ) or context.user_data.get("waiting_logo")  # /setlogo 待機中
+        or (context.user_data.get("learning_images") is not None)  # /learnimage 待機中
         if not mentioned:
+            return
+
+    # ── /learnimage 画像受け取り中 ──────────────────────────
+    if context.user_data.get("learning_images") is not None:
+        if msg.photo:
+            photo = msg.photo[-1]
+            file = await photo.get_file()
+            data = await file.download_as_bytearray()
+            context.user_data["learning_images"].append(bytes(data))
+            count = len(context.user_data["learning_images"])
+            await msg.reply_text(f"🖼 {count}枚受け取りました。続けて送るか「完了」で分析開始。")
+            return
+        elif (msg.text or "").strip() in ("完了", "done", "Done", "OK", "ok"):
+            images = context.user_data.pop("learning_images")
+            label  = context.user_data.pop("learning_label", "競合参考画像")
+            if not images:
+                await msg.reply_text("画像が1枚もありません。先に画像を送ってください。")
+                return
+            await msg.reply_text(f"🔍 {len(images)}枚の画像をVisionで分析中...")
+            image_analysis, analysis = await asyncio.to_thread(run_learn_images, images, label)
+            if image_analysis:
+                await msg.reply_text(f"✅ 学習完了！\n\n🖼 画像スタイル分析:\n\n{image_analysis}")
+            else:
+                await msg.reply_text("❌ 画像の分析に失敗しました。")
             return
 
     # ロゴ登録待機中なら写真をロゴとして保存
@@ -912,6 +937,42 @@ async def learn_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"❌ エラー: {e}")
 
 
+async def learn_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /learnimage で画像を学習。
+    コマンドと一緒に画像を送るか、コマンド送信後に複数枚送れる。
+    使い方:
+      /learnimage [ラベル]  → 以降に送った画像を学習
+      画像にキャプション /learnimage でも可
+    """
+    msg = update.message
+    label = " ".join(context.args) if context.args else "競合参考画像"
+
+    # コマンドと同時に画像が送られた場合
+    if msg.photo:
+        context.user_data["learning_images"] = []
+        context.user_data["learning_label"] = label
+        photo = msg.photo[-1]
+        file = await photo.get_file()
+        data = await file.download_as_bytearray()
+        context.user_data["learning_images"].append(bytes(data))
+        await msg.reply_text(
+            f"🖼 1枚受け取りました。続けて画像を送ってください。\n"
+            f"分析を開始するには「完了」と送信してください。\n"
+            f"ラベル: {label}"
+        )
+        return
+
+    # 画像なし → 受付モード開始
+    context.user_data["learning_images"] = []
+    context.user_data["learning_label"] = label
+    await msg.reply_text(
+        f"📸 学習させたい競合・参考アカウントの画像を送ってください（複数可）。\n"
+        f"送り終わったら「完了」と送信してください。\n"
+        f"ラベル: {label}"
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🛒 *みどりのマート SNSボット*\n\n"
@@ -923,6 +984,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setlogo - ロゴ画像を登録\n"
         "/learnposts - 自分のInstagram・X投稿を学習\n"
         "/learnurl <URL> - 競合・参考アカウントのURLを学習\n"
+        "/learnimage [ラベル] - 競合の画像を直接送って学習\n"
         "/start - このメッセージ",
         parse_mode="Markdown"
     )
@@ -938,6 +1000,7 @@ def main():
     app.add_handler(CommandHandler("setlogo", set_logo))
     app.add_handler(CommandHandler("learnposts", learn_own_posts))
     app.add_handler(CommandHandler("learnurl", learn_url))
+    app.add_handler(CommandHandler("learnimage", learn_image))
     app.add_handler(CallbackQueryHandler(callback_handler))
     # テキスト・写真メッセージ（グループ・DM両対応）
     app.add_handler(MessageHandler(

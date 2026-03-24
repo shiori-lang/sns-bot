@@ -557,3 +557,34 @@ async def run_learn_url(url: str) -> tuple[int, str]:
     save_style_guide(guide)
 
     return len(posts), len(images), url_image_analysis, analysis
+
+
+def run_learn_images(images_bytes: list[bytes], source_label: str = "参考画像") -> tuple[str, str]:
+    """
+    画像バイトリストをVision分析してstyle_guide.jsonに追記。
+    競合アカウントの画像をユーザーが直接送る場合に使用。
+    (image_analysis, style_analysis) を返す。
+    """
+    guide = load_style_guide()
+
+    image_analysis = analyze_images_style(images_bytes, source_label)
+
+    # 既存の画像分析に追記
+    existing = guide.get("image_analysis", "")
+    if image_analysis:
+        if existing:
+            guide["image_analysis"] = f"{existing}\n【{source_label}】{image_analysis}"
+        else:
+            guide["image_analysis"] = f"【{source_label}】{image_analysis}"
+
+    # テキストスタイルも再分析
+    analysis = analyze_style({
+        "own_instagram":  guide["own_posts"].get("instagram", []),
+        "own_x":          guide["own_posts"].get("x", []),
+        "reference":      guide.get("reference_posts", []),
+        "image_analysis": guide.get("image_analysis", ""),
+    })
+    guide["style_analysis"] = analysis
+    save_style_guide(guide)
+
+    return image_analysis, analysis
