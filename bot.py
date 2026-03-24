@@ -154,26 +154,24 @@ def parse_schedule_time(text: str) -> str:
 #  画像処理
 # ════════════════════════════════════════════════════
 def resize_for_platform(image_bytes: bytes, platform: str) -> bytes:
-    """プラットフォームの推奨サイズにリサイズ（センタークロップ）"""
+    """
+    プラットフォームの推奨サイズにリサイズ（フィット＋白パディング）。
+    センタークロップは商品が切れるため、全体を収めて余白を白で埋める方式に変更。
+    """
     target_w, target_h = PLATFORM_IMAGE_SIZES.get(platform, (1080, 1080))
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    src_ratio = img.width / img.height
-    tgt_ratio = target_w / target_h
 
-    if src_ratio > tgt_ratio:
-        # 横長 → 左右をクロップ
-        new_w = int(img.height * tgt_ratio)
-        left = (img.width - new_w) // 2
-        img = img.crop((left, 0, left + new_w, img.height))
-    elif src_ratio < tgt_ratio:
-        # 縦長 → 上下をクロップ
-        new_h = int(img.width / tgt_ratio)
-        top = (img.height - new_h) // 2
-        img = img.crop((0, top, img.width, top + new_h))
+    # アスペクト比を保ちつつターゲット内に収まるようリサイズ
+    img.thumbnail((target_w, target_h), Image.LANCZOS)
 
-    img = img.resize((target_w, target_h), Image.LANCZOS)
+    # 白背景キャンバスの中央に配置
+    canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
+    x = (target_w - img.width) // 2
+    y = (target_h - img.height) // 2
+    canvas.paste(img, (x, y))
+
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=90)
+    canvas.save(buf, format="JPEG", quality=90)
     return buf.getvalue()
 
 
@@ -666,8 +664,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # ── プレビュー後の修正指示を自然言語で処理 ──────────────────
+    # ── 画像修正ボタン（🎨）押下後のテキスト入力 ──────────────
     pending_key = context.bot_data.get(f"pending_chat_{msg.chat_id}")
+    if pending_key:
+        # chat_id_msg_id 部分を抽出してeditimg_キーを確認
+        key_suffix = pending_key.replace("pending_", "", 1)  # "chat_id_msg_id"
+        editimg_key  = f"editimg_{key_suffix}"
+        rewrite_key  = f"rewrite_{key_suffix}"
+
+        if context.bot_data.pop(editimg_key, None) and not msg.photo:
+            # 画像修正モード：テキスト指示を画像修正に特化して渡す
+            pending = context.bot_data.get(pending_key, {})
+            forced = {"target": "image", "image_note": user_text, "caption_note": ""}
+            await _handle_modification(msg, context, user_text, pending, pending_key, force_mod=forced)
+            return
+
+        if context.bot_data.pop(rewrite_key, None) and not msg.photo:
+            # キャプション修正モード
+            pending = context.bot_data.get(pending_key, {})
+            forced = {"target": "caption", "image_note": "", "caption_note": user_text}
+            await _handle_modification(msg, context, user_text, pending, pending_key, force_mod=forced)
+            return
+
+    # ── プレビュー後の自由テキスト修正指示 ──────────────────────
     if pending_key and pending_key in context.bot_data and not msg.photo:
         pending = context.bot_data[pending_key]
         await _handle_modification(msg, context, user_text, pending, pending_key)
@@ -709,15 +728,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ロゴ合成（デフォルトで常に入れる。「ロゴなし」指示の場合のみスキップ）
-    if do_add_logo:
-        logos = get_logo_paths()
-        if logos:
-            image_bytes = add_logo_to_image(image_bytes)
-        else:
-            await msg.reply_text(
-                "⚠️ ロゴ未登録です。`/setlogo` でロゴを登録するとすべての投稿に自動でロゴが入ります。"
-            )
+    # ロゴ未登録の場合だけ警告（合成は _send_preview 内でリサイズ後に行う）
+    if do_add_logo and not get_logo_paths():
+        await msg.reply_text(
+            "⚠️ ロゴ未登録です。/setlogo でロゴを登録するとすべての投稿に自動でロゴが入ります。"
+        )
 
     # キャプション生成
     await msg.reply_text("✍️ キャプション生成中...")
@@ -735,8 +750,14 @@ async def _send_preview(msg, context, image_bytes, captions, platforms,
     platform_emoji = {"instagram": "📸", "x": "🐦", "line": "💚"}
     platform_sizes = {"instagram": "1080×1080", "x": "1200×675", "line": "1040×1040"}
 
-    # 各プラットフォーム向けにリサイズ（見たまま投稿）
-    sized_images = {p: resize_for_platform(image_bytes, p) for p in platforms}
+    # 各プラットフォーム向けにリサイズ → ロゴ合成（ロゴはリサイズ後に合成してクロップ欠けを防ぐ）
+    logos = get_logo_paths()
+    sized_images = {}
+    for p in platforms:
+        resized = resize_for_platform(image_bytes, p)
+        if do_add_logo and logos:
+            resized = add_logo_to_image(resized)
+        sized_images[p] = resized
 
     key = f"pending_{msg.chat_id}_{msg.message_id}"
     context.bot_data[key] = {
@@ -777,12 +798,14 @@ async def _send_preview(msg, context, image_bytes, captions, platforms,
         except Exception:
             pass
 
-    caption_lines.append("返信で修正指示を送ることもできます")
+    caption_lines.append("返信でテキスト修正指示も送れます")
 
     keyboard = [
-        [InlineKeyboardButton("✅ 今すぐ投稿",  callback_data=f"post_{msg.chat_id}_{msg.message_id}")],
-        [InlineKeyboardButton("⏰ 予約投稿",    callback_data=f"schedule_{msg.chat_id}_{msg.message_id}")],
-        [InlineKeyboardButton("❌ キャンセル",  callback_data=f"cancel_{msg.chat_id}_{msg.message_id}")],
+        [InlineKeyboardButton("✅ 今すぐ投稿",    callback_data=f"post_{msg.chat_id}_{msg.message_id}")],
+        [InlineKeyboardButton("🎨 画像を修正",    callback_data=f"editimg_{msg.chat_id}_{msg.message_id}"),
+         InlineKeyboardButton("✏️ キャプション修正", callback_data=f"rewrite_{msg.chat_id}_{msg.message_id}")],
+        [InlineKeyboardButton("⏰ 予約投稿",      callback_data=f"schedule_{msg.chat_id}_{msg.message_id}")],
+        [InlineKeyboardButton("❌ キャンセル",    callback_data=f"cancel_{msg.chat_id}_{msg.message_id}")],
     ]
     await msg.reply_text(
         "\n".join(caption_lines),
@@ -790,8 +813,9 @@ async def _send_preview(msg, context, image_bytes, captions, platforms,
     )
 
 
-async def _handle_modification(msg, context, user_text: str, pending: dict, pending_key: str):
-    """プレビュー後の自然言語修正指示を処理"""
+async def _handle_modification(msg, context, user_text: str, pending: dict, pending_key: str,
+                               force_mod: dict = None):
+    """プレビュー後の自然言語修正指示を処理。force_mod を渡すと Claude 判定をスキップ。"""
     await msg.reply_text("🤖 修正内容を解析中...")
 
     image_prompt   = pending.get("image_prompt", "")
@@ -801,23 +825,26 @@ async def _handle_modification(msg, context, user_text: str, pending: dict, pend
     schedule_time  = pending.get("schedule_time", "")
     image_bytes    = pending.get("image_bytes")
 
-    # Claudeで修正種別を判定
-    result = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=256,
-        messages=[{"role": "user", "content": f"""以下の修正指示がSNS投稿の「画像」「キャプション」「両方」のどれに関するものかを判定してください。
+    if force_mod:
+        mod = force_mod
+    else:
+        # Claudeで修正種別を判定
+        result = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=256,
+            messages=[{"role": "user", "content": f"""以下の修正指示がSNS投稿の「画像」「キャプション」「両方」のどれに関するものかを判定してください。
 
 修正指示: {user_text}
 
 JSONのみ返してください:
 {{"target": "image" or "caption" or "both", "image_note": "画像への追加指示", "caption_note": "キャプションへの追加指示"}}"""}]
-    )
-    try:
-        text = result.content[0].text.strip()
-        text = re.sub(r"```json|```", "", text).strip()
-        mod = json.loads(text)
-    except Exception:
-        mod = {"target": "both", "image_note": user_text, "caption_note": user_text}
+        )
+        try:
+            text = result.content[0].text.strip()
+            text = re.sub(r"```json|```", "", text).strip()
+            mod = json.loads(text)
+        except Exception:
+            mod = {"target": "both", "image_note": user_text, "caption_note": user_text}
 
     target = mod.get("target", "both")
 
@@ -827,9 +854,7 @@ JSONのみ返してください:
         await msg.reply_text("🎨 画像を再生成中...")
         new_image = await generate_image_gemini(new_prompt)
         if new_image:
-            if do_add_logo and get_logo_paths():
-                new_image = add_logo_to_image(new_image)
-            image_bytes = new_image
+            image_bytes = new_image   # ロゴは _send_preview 内でリサイズ後に合成
             image_prompt = new_prompt
         else:
             await msg.reply_text("⚠️ 画像の再生成に失敗しました。元の画像でキャプションのみ更新します。")
