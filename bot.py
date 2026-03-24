@@ -185,33 +185,46 @@ def resize_for_platform(image_bytes: bytes, platform: str) -> bytes:
 
 def find_best_logo_position(base_img: Image.Image, logo_w: int, logo_h: int) -> tuple[int, int]:
     """
-    画像の4隅を比較して最も明るい（被りにくい）コーナーを選ぶ
-    ロゴは白・明るい背景に映えるため、最も暗い（コントラストが取れる）隅を選ぶ
+    画像全体をグリッドスキャンして視覚的に最も空いている場所を選択。
+    低解像度版で各候補位置のピクセル分散（視覚的複雑さ）を計算し、
+    最もシンプルな領域（ロゴが映える場所）を選ぶ。
     """
     margin = 20
     w, h = base_img.width, base_img.height
-    gray = base_img.convert("L")
 
-    corners = {
-        "top_left":     (margin, margin),
-        "top_right":    (w - logo_w - margin, margin),
-        "bottom_left":  (margin, h - logo_h - margin),
-        "bottom_right": (w - logo_w - margin, h - logo_h - margin),
-    }
+    # 高速化のため小さくリサイズしてグレースケール化
+    scale = 4
+    small = base_img.convert("L").resize((w // scale, h // scale), Image.LANCZOS)
+    sw, sh = small.size
+    lw, lh = logo_w // scale, logo_h // scale
 
-    # 各隅の領域の平均輝度を計算（輝度が低い＝暗い→ロゴが目立つ）
-    best_pos = corners["bottom_right"]
+    # グリッド状に候補位置を走査（画像端の余白内で均等サンプリング）
+    step_x = max(1, (sw - lw - margin // scale) // 6)
+    step_y = max(1, (sh - lh - margin // scale) // 6)
+
+    best_pos = (w - logo_w - margin, h - logo_h - margin)  # デフォルト右下
     best_score = float("inf")
 
-    for name, (cx, cy) in corners.items():
-        region = gray.crop((cx, cy, cx + logo_w, cy + logo_h))
-        arr = list(region.getdata())
-        avg = sum(arr) / len(arr) if arr else 128
-        # 端に近いほどスコアを下げる（端の方が自然）
-        score = avg
-        if score < best_score:
-            best_score = score
-            best_pos = (cx, cy)
+    xs = range(margin // scale, sw - lw - margin // scale, step_x)
+    ys = range(margin // scale, sh - lh - margin // scale, step_y)
+
+    for sy in ys:
+        for sx in xs:
+            region = small.crop((sx, sy, sx + lw, sy + lh))
+            pixels = list(region.getdata())
+            if not pixels:
+                continue
+            avg = sum(pixels) / len(pixels)
+            # 分散（視覚的複雑さ）= 低いほどシンプルでロゴが映える
+            variance = sum((p - avg) ** 2 for p in pixels) / len(pixels)
+            # 端ほど優先（中央寄りにはならないようペナルティ）
+            cx_ratio = abs((sx + lw / 2) / sw - 0.5)  # 0.5 = 端、0 = 中央
+            edge_bonus = (1 - cx_ratio) * 30  # 中央に近いほど不利
+            score = variance + edge_bonus
+
+            if score < best_score:
+                best_score = score
+                best_pos = (sx * scale, sy * scale)
 
     return best_pos
 
