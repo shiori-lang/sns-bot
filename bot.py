@@ -318,10 +318,11 @@ async def generate_image_gemini(prompt: str) -> bytes | None:
         client = genai_new.Client(api_key=GEMINI_API_KEY)
         response = await asyncio.to_thread(
             client.models.generate_content,
-            model="gemini-2.0-flash-exp",
+            model="gemini-2.0-flash-preview-image-generation",
             contents=[full_prompt],
             config=genai_types.GenerateContentConfig(
-                response_modalities=["IMAGE", "TEXT"]
+                response_modalities=["IMAGE"],
+                image_config=genai_types.ImageConfig(aspect_ratio="1:1"),
             ),
         )
         if not response.candidates:
@@ -334,10 +335,59 @@ async def generate_image_gemini(prompt: str) -> bytes | None:
         logger.error(f"Gemini画像生成エラー: {e}")
     return None
 
+def _build_gemini_design_prompt(caption_instr: str, n_photos: int, style_section: str) -> str:
+    """
+    Claude Haiku でテーマを分析し、Gemini 向けの詳細デザインプロンプト（英語）を生成。
+    背景テーマ・テキスト内容・レイアウトをテーマに合わせて動的に決定する。
+    """
+    try:
+        resp = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=700,
+            messages=[{"role": "user", "content": f"""
+You are a professional SNS graphic designer for a Japanese supermarket "Midori no Mart".
+Based on the post theme below, write a detailed English image generation prompt for Gemini AI.
+
+Post theme (Japanese): {caption_instr}
+Number of product photos: {n_photos}
+
+The prompt must describe a commercial-quality Japanese supermarket SNS poster (1:1 square) like these styles:
+- Snacks/drinks at night → starry/dark background, warm spotlight on products
+- Limited edition items → bold blue geometric background, stamp/badge design
+- Fruit/fresh items → bright outdoor nature background with fruit elements
+- Valentine/seasonal → thematic color scheme (pink/red/etc), festive decorations
+- Product feature/特集 → sunburst or radial background matching product color
+
+Include all of these in your prompt:
+1. Specific background theme and colors matching the product
+2. Japanese headline text to overlay (3-8 chars catchphrase, bold, large)
+3. English subtitle text (short phrase)
+4. Product layout: {"center hero shot" if n_photos == 1 else f"grid of {n_photos} products, all clearly visible"}
+5. Decorative elements (badges, lines, sparkles, etc.) appropriate to theme
+6. Overall mood and style
+
+{style_section}
+
+Return ONLY the image generation prompt in English. No explanation.
+"""}]
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        logger.error(f"デザインプロンプト生成エラー: {e}")
+        # フォールバック
+        return (
+            f"Professional Japanese supermarket SNS poster (1:1 square) for Midori no Mart. "
+            f"Theme: {caption_instr}. "
+            f"Vibrant commercial advertisement style, bold Japanese headline text, English subtitle, "
+            f"{'center hero product shot' if n_photos == 1 else f'grid layout of {n_photos} products'}. "
+            f"High quality graphic design, purchase-inspiring visuals. No prices."
+        )
+
+
 async def redesign_product_image(photos: list[bytes], caption_instr: str) -> bytes | None:
     """
     1枚または複数枚の商品写真を受け取り、学習済みスタイルでSNS用にデザインし直す。
-    google-genai SDK の画像入力→画像出力機能を使用。
+    Claude Haiku でテーマ分析 → Gemini 画像生成の二段構え。
     """
     try:
         from google import genai as genai_new
@@ -348,28 +398,13 @@ async def redesign_product_image(photos: list[bytes], caption_instr: str) -> byt
 
     guide = load_style_guide()
     image_analysis = guide.get("image_analysis", "")
-    style_section = f"\n【学習済みスタイルの参考】\n{image_analysis}\n" if image_analysis else ""
+    style_section = f"Reference style from past posts: {image_analysis}" if image_analysis else ""
 
-    n = len(photos)
-    layout_note = (
-        "商品を中央にドーンと大きく配置" if n == 1 else
-        f"{n}個の商品を均等にグリッド配置し、すべてはっきり見えるようにする"
+    # Step 1: Claude Haiku でテーマに最適化したデザインプロンプトを生成
+    prompt = await asyncio.to_thread(
+        _build_gemini_design_prompt, caption_instr, len(photos), style_section
     )
-
-    prompt = (
-        f"スーパー「みどりのマート」のInstagram用SNS投稿画像（1:1正方形）を生成してください。\n\n"
-        f"【投稿テーマ】{caption_instr}\n\n"
-        f"【デザイン要件】\n"
-        f"- スーパーの広告チラシ・ポスター風の本格的なグラフィックデザイン\n"
-        f"- 添付商品写真から商品パッケージを切り抜き、{layout_note}\n"
-        f"- テーマに合った鮮やかな背景色（グラデーションや模様もOK）\n"
-        f"- 上部に日本語キャッチコピー（大きめフォント・目立つ色）\n"
-        f"- 英語サブタイトルも添える（例: SPECIAL FEATURE / LIMITED OFFER 等）\n"
-        f"- 下部にサブテキスト（例: 数量限定 / お買い得 等）\n"
-        f"- 全体的に明るく活気があり、購買意欲を高める商業デザイン\n"
-        f"- 価格・金額の数字は入れない\n"
-        f"{style_section}"
-    )
+    logger.info(f"Generated design prompt: {prompt[:200]}")
 
     try:
         client = genai_new.Client(api_key=GEMINI_API_KEY)
@@ -386,10 +421,11 @@ async def redesign_product_image(photos: list[bytes], caption_instr: str) -> byt
 
         response = await asyncio.to_thread(
             client.models.generate_content,
-            model="gemini-2.0-flash-exp",
+            model="gemini-2.0-flash-preview-image-generation",
             contents=contents,
             config=genai_types.GenerateContentConfig(
-                response_modalities=["IMAGE", "TEXT"]
+                response_modalities=["IMAGE"],
+                image_config=genai_types.ImageConfig(aspect_ratio="1:1"),
             ),
         )
 
