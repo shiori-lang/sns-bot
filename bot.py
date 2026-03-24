@@ -308,8 +308,11 @@ async def generate_image_gemini(prompt: str) -> bytes | None:
 
     full_prompt = (
         f"{style_prefix}"
-        f"スーパー「みどりのマート」のSNS投稿用の魅力的な商品画像を生成してください。\n"
-        f"内容: {prompt}"
+        f"スーパー「みどりのマート」のInstagram投稿用（1:1正方形）の本格的な広告ポスター画像を生成してください。\n"
+        f"スーパーの広告チラシ・ポスター風のグラフィックデザイン。\n"
+        f"日本語キャッチコピー（大きめフォント）と英語サブタイトルを入れ、鮮やかな背景色で商業デザインらしく仕上げる。\n"
+        f"価格・金額の数字は入れない。\n"
+        f"テーマ: {prompt}"
     )
     try:
         client = genai_new.Client(api_key=GEMINI_API_KEY)
@@ -345,18 +348,26 @@ async def redesign_product_image(photos: list[bytes], caption_instr: str) -> byt
 
     guide = load_style_guide()
     image_analysis = guide.get("image_analysis", "")
-    style_section = f"\n【学習済み画像スタイル】\n{image_analysis}\n" if image_analysis else ""
+    style_section = f"\n【学習済みスタイルの参考】\n{image_analysis}\n" if image_analysis else ""
 
-    multi_note = f"{len(photos)}枚の商品写真を組み合わせて1枚の" if len(photos) > 1 else ""
+    n = len(photos)
+    layout_note = (
+        "商品を中央にドーンと大きく配置" if n == 1 else
+        f"{n}個の商品を均等にグリッド配置し、すべてはっきり見えるようにする"
+    )
+
     prompt = (
-        f"以下の写真に写っている商品を使って、スーパー「みどりのマート」のSNS投稿用に"
-        f"{multi_note}プロフェッショナルなデザインの商品画像を新たに生成してください。\n\n"
-        f"要件:\n"
-        f"- 写真から商品だけを切り出し、背景はデザインし直す\n"
-        f"- 複数商品の場合はバランスよくレイアウトする\n"
-        f"- 魅力的・清潔感があり、購買意欲が高まるビジュアル\n"
-        f"- 価格やテキストは入れない（キャプションで対応）\n"
-        f"- 投稿内容のヒント: {caption_instr}\n"
+        f"スーパー「みどりのマート」のInstagram用SNS投稿画像（1:1正方形）を生成してください。\n\n"
+        f"【投稿テーマ】{caption_instr}\n\n"
+        f"【デザイン要件】\n"
+        f"- スーパーの広告チラシ・ポスター風の本格的なグラフィックデザイン\n"
+        f"- 添付商品写真から商品パッケージを切り抜き、{layout_note}\n"
+        f"- テーマに合った鮮やかな背景色（グラデーションや模様もOK）\n"
+        f"- 上部に日本語キャッチコピー（大きめフォント・目立つ色）\n"
+        f"- 英語サブタイトルも添える（例: SPECIAL FEATURE / LIMITED OFFER 等）\n"
+        f"- 下部にサブテキスト（例: 数量限定 / お買い得 等）\n"
+        f"- 全体的に明るく活気があり、購買意欲を高める商業デザイン\n"
+        f"- 価格・金額の数字は入れない\n"
         f"{style_section}"
     )
 
