@@ -157,26 +157,37 @@ def parse_schedule_time(text: str) -> str:
 #  画像処理
 # ════════════════════════════════════════════════════
 def resize_for_platform(image_bytes: bytes, platform: str) -> bytes:
-    """プラットフォームの推奨サイズにぴったりリサイズ（センタークロップ）"""
+    """
+    プラットフォームの推奨サイズにリサイズ。
+    - Instagram / LINE（1:1）: センタークロップで正方形にぴったり
+    - X（16:9）: 縦を保ちつつ横をレターボックス（黒バー）で埋める
+      → 縦長・正方形の商品画像が上下で切れないようにする
+    """
     target_w, target_h = PLATFORM_IMAGE_SIZES.get(platform, (1080, 1080))
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    # アスペクト比を保ちながらターゲットサイズを完全に覆うようスケール
     src_ratio = img.width / img.height
     tgt_ratio = target_w / target_h
-    if src_ratio > tgt_ratio:
-        # 横長 → 高さ基準でスケール後、横をクロップ
-        new_h = target_h
-        new_w = int(img.width * target_h / img.height)
-    else:
-        # 縦長 → 幅基準でスケール後、縦をクロップ
-        new_w = target_w
-        new_h = int(img.height * target_w / img.width)
 
-    img = img.resize((new_w, new_h), Image.LANCZOS)
-    x = (new_w - target_w) // 2
-    y = (new_h - target_h) // 2
-    img = img.crop((x, y, x + target_w, y + target_h))
+    if platform == "x":
+        # X は縦を優先して全体を収め、足りない横幅を黒バーで補う
+        img.thumbnail((target_w, target_h), Image.LANCZOS)
+        canvas = Image.new("RGB", (target_w, target_h), (0, 0, 0))
+        x = (target_w - img.width) // 2
+        y = (target_h - img.height) // 2
+        canvas.paste(img, (x, y))
+        img = canvas
+    else:
+        # Instagram / LINE: センタークロップ
+        if src_ratio > tgt_ratio:
+            new_h = target_h
+            new_w = int(img.width * target_h / img.height)
+        else:
+            new_w = target_w
+            new_h = int(img.height * target_w / img.width)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        x = (new_w - target_w) // 2
+        y = (new_h - target_h) // 2
+        img = img.crop((x, y, x + target_w, y + target_h))
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)
@@ -265,6 +276,21 @@ def select_best_logo(base_img: Image.Image, logos: list[Path]) -> Image.Image:
     return best_logo or Image.open(logos[0]).convert("RGBA")
 
 
+def _remove_white_background(logo: Image.Image, threshold: int = 240) -> Image.Image:
+    """ロゴの白・明るい背景を透明化する（JPEGロゴ対応）"""
+    logo = logo.convert("RGBA")
+    data = logo.getdata()
+    new_data = []
+    for r, g, b, a in data:
+        # ほぼ白（全チャンネルが threshold 以上）なら透明に
+        if r >= threshold and g >= threshold and b >= threshold:
+            new_data.append((r, g, b, 0))
+        else:
+            new_data.append((r, g, b, a))
+    logo.putdata(new_data)
+    return logo
+
+
 def add_logo_to_image(image_bytes: bytes) -> bytes:
     """画像を分析してロゴを最適な位置に自動合成（複数ロゴ対応）"""
     logos = get_logo_paths()
@@ -275,6 +301,8 @@ def add_logo_to_image(image_bytes: bytes) -> bytes:
         base_img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
         # 最適なロゴを自動選択
         logo = select_best_logo(base_img, logos)
+        # 白背景を透明化（JPEG登録ロゴ対応）
+        logo = _remove_white_background(logo)
 
         # ロゴを画像幅の18%にリサイズ
         logo_w = int(base_img.width * 0.18)
@@ -318,7 +346,7 @@ async def generate_image_gemini(prompt: str) -> bytes | None:
         client = genai_new.Client(api_key=GEMINI_API_KEY)
         response = await asyncio.to_thread(
             client.models.generate_content,
-            model="gemini-2.0-flash-preview-image-generation",
+            model="gemini-2.5-flash-image",
             contents=[full_prompt],
             config=genai_types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
@@ -421,7 +449,7 @@ async def redesign_product_image(photos: list[bytes], caption_instr: str) -> byt
 
         response = await asyncio.to_thread(
             client.models.generate_content,
-            model="gemini-2.0-flash-preview-image-generation",
+            model="gemini-2.5-flash-image",
             contents=contents,
             config=genai_types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
