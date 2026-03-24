@@ -168,26 +168,17 @@ def resize_for_platform(image_bytes: bytes, platform: str) -> bytes:
     src_ratio = img.width / img.height
     tgt_ratio = target_w / target_h
 
-    if platform == "x":
-        # X は縦を優先して全体を収め、足りない横幅を黒バーで補う
-        img.thumbnail((target_w, target_h), Image.LANCZOS)
-        canvas = Image.new("RGB", (target_w, target_h), (0, 0, 0))
-        x = (target_w - img.width) // 2
-        y = (target_h - img.height) // 2
-        canvas.paste(img, (x, y))
-        img = canvas
+    # センタークロップ（全プラットフォーム共通）
+    if src_ratio > tgt_ratio:
+        new_h = target_h
+        new_w = int(img.width * target_h / img.height)
     else:
-        # Instagram / LINE: センタークロップ
-        if src_ratio > tgt_ratio:
-            new_h = target_h
-            new_w = int(img.width * target_h / img.height)
-        else:
-            new_w = target_w
-            new_h = int(img.height * target_w / img.width)
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-        x = (new_w - target_w) // 2
-        y = (new_h - target_h) // 2
-        img = img.crop((x, y, x + target_w, y + target_h))
+        new_w = target_w
+        new_h = int(img.height * target_w / img.width)
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    x = (new_w - target_w) // 2
+    y = (new_h - target_h) // 2
+    img = img.crop((x, y, x + target_w, y + target_h))
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)
@@ -358,7 +349,8 @@ async def generate_image_gemini(prompt: str) -> bytes | None:
             return None
         for part in response.candidates[0].content.parts:
             if part.inline_data:
-                return base64.b64decode(part.inline_data.data)
+                data = part.inline_data.data
+                return data if isinstance(data, bytes) else base64.b64decode(data)
     except Exception as e:
         logger.error(f"Gemini画像生成エラー: {e}")
     return None
@@ -462,7 +454,8 @@ async def redesign_product_image(photos: list[bytes], caption_instr: str) -> byt
             return None
         for part in response.candidates[0].content.parts:
             if part.inline_data:
-                return base64.b64decode(part.inline_data.data)
+                data = part.inline_data.data
+                return data if isinstance(data, bytes) else base64.b64decode(data)
     except Exception as e:
         logger.error(f"Gemini画像デザイン生成エラー: {e}")
     return None
