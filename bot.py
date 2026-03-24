@@ -60,6 +60,9 @@ LOGO_PATH = LOGO_DIR / "logo_1.png"  # 後方互換
 
 JST = timezone(timedelta(hours=9))
 
+# メディアグループ遅延処理用タスク管理（job_queue の代替）
+_media_group_tasks: dict[str, "asyncio.Task"] = {}
+
 # 各プラットフォームの推奨画像サイズ（幅×高さ）
 PLATFORM_IMAGE_SIZES = {
     "instagram": (1080, 1080),
@@ -498,10 +501,9 @@ def post_line(image_bytes: bytes, caption: str) -> bool:
 # ════════════════════════════════════════════════════
 #  メディアグループ（複数枚アルバム）まとめて処理
 # ════════════════════════════════════════════════════
-async def _process_media_group_job(context: ContextTypes.DEFAULT_TYPE):
-    """2秒バッファ後に複数写真をまとめてデザイン生成する JobQueue コールバック"""
-    grp_key = context.job.data
-    grp = context.bot_data.pop(grp_key, None)
+async def _process_media_group_direct(app, grp_key: str):
+    """2秒バッファ後に複数写真をまとめてデザイン生成する（asyncio.create_task で呼ばれる）"""
+    grp = app.bot_data.pop(grp_key, None)
     if not grp:
         return
 
@@ -519,7 +521,7 @@ async def _process_media_group_job(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"parse_instruction error in media group job: {e}")
             parsed = {}
 
-    await context.bot.send_message(chat_id=chat_id,
+    await app.bot.send_message(chat_id=chat_id,
         text=f"🎨 {len(photos)}枚の写真から商品を切り出してデザインし直し中...（少し時間がかかります）")
 
     platforms     = parsed.get("platforms", ["instagram", "x"])
@@ -532,36 +534,44 @@ async def _process_media_group_job(context: ContextTypes.DEFAULT_TYPE):
 
     use_as_is = any(kw in user_text for kw in ("そのまま", "この写真で", "この画像で", "加工なし"))
     if use_as_is:
-        # 複数枚そのまま → 1枚目をメイン画像として使用
         image_bytes = photos[0]
     else:
         image_bytes = await redesign_product_image(photos, caption_instr)
         if not image_bytes:
-            await context.bot.send_message(chat_id=chat_id,
+            await app.bot.send_message(chat_id=chat_id,
                 text="⚠️ デザイン生成に失敗しました。1枚目の写真を使います。")
             image_bytes = photos[0]
 
     # ロゴ未登録警告
     if do_add_logo and not get_logo_paths():
-        await context.bot.send_message(chat_id=chat_id,
+        await app.bot.send_message(chat_id=chat_id,
             text="⚠️ ロゴ未登録です。/setlogo でロゴを登録するとすべての投稿に自動でロゴが入ります。")
 
-    await context.bot.send_message(chat_id=chat_id, text="✍️ キャプション生成中...")
+    await app.bot.send_message(chat_id=chat_id, text="✍️ キャプション生成中...")
     captions = {p: generate_caption(caption_instr, p, post_type, items) for p in platforms}
 
-    # _send_preview に必要な msg ライクオブジェクトを作成
     class _FakeMsg:
         def __init__(self, chat_id, message_id, bot):
-            self.chat_id   = chat_id
+            self.chat_id    = chat_id
             self.message_id = message_id
-            self._bot      = bot
+            self._bot       = bot
         async def reply_text(self, text, **kw):
             await self._bot.send_message(chat_id=self.chat_id, text=text, **kw)
         async def reply_photo(self, photo, **kw):
             await self._bot.send_photo(chat_id=self.chat_id, photo=photo, **kw)
 
-    fake_msg = _FakeMsg(chat_id, message_id, context.bot)
-    await _send_preview(fake_msg, context, image_bytes, captions, platforms,
+    # bot_data / user_data を持つダミーコンテキストを作成
+    class _FakeCtx:
+        def __init__(self, application):
+            self.bot       = application.bot
+            self.bot_data  = application.bot_data
+            self.user_data = {}
+            self.job_queue = application.job_queue  # None でも可
+        def _get_pending_key(self): return None
+
+    fake_msg = _FakeMsg(chat_id, message_id, app.bot)
+    fake_ctx = _FakeCtx(app)
+    await _send_preview(fake_msg, fake_ctx, image_bytes, captions, platforms,
                         image_prompt, caption_instr, do_add_logo, schedule_time,
                         post_type, items)
 
@@ -715,17 +725,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.photo and msg.media_group_id and context.user_data.get("waiting_logo"):
         await _save_logo(msg)
         # 同じアルバムの残り写真も処理できるよう waiting_logo は True のまま維持
-        # ジョブで 2秒後に waiting_logo を解除する
-        job_name = f"clear_waiting_logo_{msg.chat_id}"
-        for job in context.job_queue.get_jobs_by_name(job_name):
-            job.schedule_removal()
-        async def _clear_waiting_logo(ctx: ContextTypes.DEFAULT_TYPE):
-            ctx.job.data["user_data"].pop("waiting_logo", None)
-        context.job_queue.run_once(
-            _clear_waiting_logo, when=3,
-            data={"user_data": context.user_data},
-            name=job_name,
-        )
+        # 3秒後に自動解除
+        clear_key = f"clear_logo_{msg.chat_id}"
+        old = _media_group_tasks.pop(clear_key, None)
+        if old and not old.done():
+            old.cancel()
+        _ud = context.user_data
+        async def _clear_logo_after():
+            await asyncio.sleep(3)
+            _ud.pop("waiting_logo", None)
+        _media_group_tasks[clear_key] = asyncio.create_task(_clear_logo_after())
         return
 
     # ── メディアグループ（アルバム）は user_text チェックより先に処理 ──────
@@ -750,11 +759,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await msg.photo[-1].get_file()
         context.bot_data[grp_key]["photos"].append(bytes(await file.download_as_bytearray()))
 
-        job_name = f"process_media_group_{msg.media_group_id}"
-        for job in context.job_queue.get_jobs_by_name(job_name):
-            job.schedule_removal()
-        context.job_queue.run_once(_process_media_group_job, when=2,
-                                   data=grp_key, name=job_name)
+        # 既存タスクをキャンセルして再スケジュール（最後の写真から2秒後に処理）
+        old = _media_group_tasks.pop(grp_key, None)
+        if old and not old.done():
+            old.cancel()
+        _app = context.application
+        async def _run_after_delay(key=grp_key):
+            await asyncio.sleep(2)
+            await _process_media_group_direct(_app, key)
+        _media_group_tasks[grp_key] = asyncio.create_task(_run_after_delay())
         return  # バッファに積んだだけ
 
     # ロゴ登録待機中なら写真をロゴとして保存
@@ -804,6 +817,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             dt = datetime.fromisoformat(iso_time)
             # 予約ジョブを登録
+            if not context.job_queue:
+                await msg.reply_text("❌ 予約投稿機能が利用できません（APScheduler未設定）。")
+                return
+
             job_name = f"scheduled_{msg.chat_id}"
             # 同一チャットの既存予約を上書き
             for old_job in context.job_queue.get_jobs_by_name(job_name):
