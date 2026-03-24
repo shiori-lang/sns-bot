@@ -9,3 +9,4 @@ Pillow
 aiohttp
 aiofiles==24.1.0
 playwright
+instagrapi

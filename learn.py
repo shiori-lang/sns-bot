@@ -28,6 +28,8 @@ STYLE_GUIDE_PATH = BASE_DIR / "style_guide.json"
 
 INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN")
 INSTAGRAM_USER_ID      = os.getenv("INSTAGRAM_USER_ID")
+INSTAGRAM_USERNAME     = os.getenv("INSTAGRAM_USERNAME")   # instagrapi用（競合スクレイピング）
+INSTAGRAM_PASSWORD     = os.getenv("INSTAGRAM_PASSWORD")   # instagrapi用（競合スクレイピング）
 X_API_KEY              = os.getenv("X_API_KEY")
 X_API_SECRET           = os.getenv("X_API_SECRET")
 X_ACCESS_TOKEN         = os.getenv("X_ACCESS_TOKEN")
@@ -120,10 +122,17 @@ def _download_image(url: str) -> bytes | None:
     if not url:
         return None
     try:
-        r = requests.get(url, timeout=10,
-                         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-        if r.status_code == 200 and "image" in r.headers.get("Content-Type", ""):
-            return r.content
+        r = requests.get(url, timeout=15, headers={
+            # モバイルUAの方がInstagram CDNで弾かれにくい
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+                          "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+            "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+        })
+        if r.status_code == 200 and len(r.content) > 500:
+            ct = r.headers.get("Content-Type", "")
+            # Content-Typeがなくてもバイナリなら画像として扱う
+            if "image" in ct or "octet-stream" in ct or not ct:
+                return r.content
     except Exception as e:
         logger.warning(f"画像DL失敗 ({url[:60]}): {e}")
     return None
@@ -137,10 +146,114 @@ def _prepare_image_for_vision(img_bytes: bytes) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 # ════════════════════════════════════════════════════
+#  instagrapi でInstagramプロフィールを取得
+# ════════════════════════════════════════════════════
+_ig_client = None  # セッションキャッシュ
+
+def _get_ig_client():
+    """instagrapiクライアントをログイン済み状態で返す（セッション再利用）"""
+    global _ig_client
+    if _ig_client:
+        return _ig_client
+    if not (INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD):
+        raise RuntimeError("INSTAGRAM_USERNAME / INSTAGRAM_PASSWORD が未設定です")
+
+    from instagrapi import Client
+    session_path = BASE_DIR / "ig_session.json"
+    cl = Client()
+    if session_path.exists():
+        try:
+            cl.load_settings(session_path)
+            cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+            logger.info("instagrapi: セッション再利用でログイン成功")
+        except Exception as e:
+            logger.warning(f"instagrapi: セッション再利用失敗、再ログイン: {e}")
+            session_path.unlink(missing_ok=True)
+            cl = Client()
+            cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+    else:
+        cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+        logger.info("instagrapi: 新規ログイン成功")
+
+    cl.dump_settings(session_path)
+    _ig_client = cl
+    return cl
+
+
+def fetch_instagram_profile_posts(profile_url: str, max_posts: int = 20) -> list[dict]:
+    """
+    instagrapiを使ってInstagramプロフィールから投稿（キャプション＋画像バイト）を取得。
+    INSTAGRAM_USERNAME/PASSWORDが未設定の場合は空リストを返す。
+    """
+    if not (INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD):
+        return []
+
+    # プロフィールURLからユーザー名を抽出
+    # 例: https://www.instagram.com/username/ → "username"
+    username = profile_url.rstrip("/").split("?")[0].split("/")[-1].lstrip("@")
+    if not username:
+        return []
+
+    try:
+        cl = _get_ig_client()
+        user_id = cl.user_id_from_username(username)
+        medias = cl.user_medias(user_id, amount=max_posts)
+
+        posts = []
+        for media in medias:
+            caption = media.caption_text or ""
+            # 画像URLを取得（Photo / Video thumbnail / Carousel先頭）
+            image_url = ""
+            if media.thumbnail_url:
+                image_url = str(media.thumbnail_url)
+            elif media.image_versions2 and media.image_versions2.candidates:
+                image_url = str(media.image_versions2.candidates[0].url)
+
+            # 画像を直接ダウンロード（instagrapi認証済みセッションで取得）
+            image_bytes = None
+            try:
+                tmp = cl.photo_download_by_pk(media.pk, folder="/tmp")
+                with open(tmp, "rb") as f:
+                    image_bytes = f.read()
+                os.unlink(tmp)
+            except Exception:
+                # フォールバック: URL から直接ダウンロード
+                if image_url:
+                    image_bytes = _download_image(image_url)
+
+            posts.append({
+                "text":        caption,
+                "image_url":   image_url,
+                "image_bytes": image_bytes,
+            })
+
+        logger.info(f"instagrapi: @{username} から {len(posts)}件取得")
+        return posts
+    except Exception as e:
+        logger.error(f"instagrapi取得エラー (@{username}): {e}")
+        global _ig_client
+        _ig_client = None  # 次回は再ログイン
+        return []
+
+
+# ════════════════════════════════════════════════════
 #  競合URLからスクレイピング（Playwright）
 # ════════════════════════════════════════════════════
 async def scrape_url(url: str) -> list[dict]:
-    """URLからSNS投稿テキストと画像URLを抽出。list[{"text": str, "image_url": str}]を返す"""
+    """
+    URLからSNS投稿テキストと画像URLを抽出。list[{"text": str, "image_url": str, "image_bytes": bytes|None}]を返す。
+    Instagramプロフィールページはinstagrapiを優先使用。
+    """
+    # ── Instagram プロフィールページ → instagrapi 優先 ──
+    if "instagram.com" in url and "/p/" not in url and "/reel/" not in url:
+        if INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD:
+            logger.info(f"instagrapiでInstagramプロフィールを取得: {url}")
+            posts = await asyncio.to_thread(fetch_instagram_profile_posts, url)
+            if posts:
+                return posts
+            logger.warning("instagrapi取得失敗、Playwrightにフォールバック")
+
+    # ── Playwright スクレイピング ──
     from playwright.async_api import async_playwright
 
     posts = []
@@ -407,10 +520,12 @@ async def run_learn_url(url: str) -> tuple[int, str]:
         })
 
     # 取得した画像をVisionで分析
-    image_urls = [p["image_url"] for p in posts if p.get("image_url")]
+    # instagrapi経由ならimage_bytesが既に入っている。なければURLからDL。
     images = []
-    for img_url in image_urls[:10]:
-        img = _download_image(img_url)
+    for p in posts[:10]:
+        img = p.get("image_bytes")  # instagrapiで直接取得済み
+        if not img and p.get("image_url"):
+            img = _download_image(p["image_url"])
         if img:
             images.append(img)
 
