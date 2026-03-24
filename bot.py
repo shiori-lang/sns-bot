@@ -695,11 +695,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("✍️ キャプション生成中...")
     captions = {p: generate_caption(caption_instr, p, post_type, items) for p in platforms}
 
-    await _send_preview(msg, context, image_bytes, captions, platforms, image_prompt, caption_instr, do_add_logo, schedule_time)
+    await _send_preview(msg, context, image_bytes, captions, platforms,
+                        image_prompt, caption_instr, do_add_logo, schedule_time,
+                        post_type, items)
 
 
 async def _send_preview(msg, context, image_bytes, captions, platforms,
-                        image_prompt="", caption_instr="", do_add_logo=True, schedule_time=""):
+                        image_prompt="", caption_instr="", do_add_logo=True, schedule_time="",
+                        post_type="single", items=None):
     """プレビュー画像とキャプションを送信（各プラットフォームのリサイズ済み画像を表示）"""
     platform_emoji = {"instagram": "📸", "x": "🐦", "line": "💚"}
     platform_sizes = {"instagram": "1080×1080", "x": "1200×675", "line": "1040×1040"}
@@ -717,8 +720,10 @@ async def _send_preview(msg, context, image_bytes, captions, platforms,
         "message_id":   msg.message_id,
         "image_prompt": image_prompt,
         "caption_instr": caption_instr,
-        "do_add_logo":  do_add_logo,
+        "do_add_logo":   do_add_logo,
         "schedule_time": schedule_time,
+        "post_type":     post_type,
+        "items":         items or [],
     }
     context.bot_data[f"pending_chat_{msg.chat_id}"] = key
 
@@ -803,14 +808,20 @@ JSONのみ返してください:
     if target in ("caption", "both"):
         new_instr = f"{caption_instr}。修正: {mod.get('caption_note', user_text)}"
         await msg.reply_text("✍️ キャプション修正中...")
-        captions = {p: generate_caption(new_instr, p) for p in platforms}
+        post_type = pending.get("post_type", "single")
+        items     = pending.get("items", [])
+        captions = {p: generate_caption(new_instr, p, post_type, items) for p in platforms}
         caption_instr = new_instr
     else:
         captions = pending.get("captions", {})
 
     # 古いpendingを削除して新しいプレビューを表示
     del context.bot_data[pending_key]
-    await _send_preview(msg, context, image_bytes, captions, platforms, image_prompt, caption_instr, do_add_logo, schedule_time)
+    post_type = pending.get("post_type", "single")
+    items     = pending.get("items", [])
+    await _send_preview(msg, context, image_bytes, captions, platforms,
+                        image_prompt, caption_instr, do_add_logo, schedule_time,
+                        post_type, items)
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
