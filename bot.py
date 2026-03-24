@@ -303,20 +303,22 @@ async def generate_image_gemini(prompt: str) -> bytes | None:
         logger.error(f"Gemini画像生成エラー: {e}")
     return None
 
-async def redesign_product_image(image_bytes: bytes, caption_instr: str) -> bytes | None:
+async def redesign_product_image(photos: list[bytes], caption_instr: str) -> bytes | None:
     """
-    ユーザーが送った写真を受け取り、商品だけを使って学習済みスタイルで
-    SNS投稿用にデザインし直した画像を生成する（Gemini 画像入力→画像出力）。
+    1枚または複数枚の商品写真を受け取り、学習済みスタイルでSNS用にデザインし直す。
+    Gemini の画像入力→画像出力機能を使用。
     """
     guide = load_style_guide()
     image_analysis = guide.get("image_analysis", "")
     style_section = f"\n【学習済み画像スタイル】\n{image_analysis}\n" if image_analysis else ""
 
+    multi_note = f"{len(photos)}枚の商品写真を組み合わせて1枚の" if len(photos) > 1 else ""
     prompt = (
         f"以下の写真に写っている商品を使って、スーパー「みどりのマート」のSNS投稿用に"
-        f"プロフェッショナルなデザインの商品画像を新たに生成してください。\n\n"
+        f"{multi_note}プロフェッショナルなデザインの商品画像を新たに生成してください。\n\n"
         f"要件:\n"
         f"- 写真から商品だけを切り出し、背景はデザインし直す\n"
+        f"- 複数商品の場合はバランスよくレイアウトする\n"
         f"- 魅力的・清潔感があり、購買意欲が高まるビジュアル\n"
         f"- 価格やテキストは入れない（キャプションで対応）\n"
         f"- 投稿内容のヒント: {caption_instr}\n"
@@ -324,15 +326,15 @@ async def redesign_product_image(image_bytes: bytes, caption_instr: str) -> byte
     )
 
     try:
-        # PIL Image として読み込んでGeminiに渡す
-        from PIL import Image as PILImage
-        pil_img = PILImage.open(io.BytesIO(image_bytes)).convert("RGB")
-        # 大きすぎると遅いので最大1024pxに縮小してから送る
-        pil_img.thumbnail((1024, 1024), PILImage.LANCZOS)
+        pil_imgs = []
+        for b in photos[:4]:  # Gemini の上限を考慮して最大4枚
+            img = Image.open(io.BytesIO(b)).convert("RGB")
+            img.thumbnail((1024, 1024), Image.LANCZOS)
+            pil_imgs.append(img)
 
         model = genai.GenerativeModel("gemini-2.0-flash-exp")
         response = model.generate_content(
-            [prompt, pil_img],
+            [prompt] + pil_imgs,
             generation_config=genai.GenerationConfig(
                 response_modalities=["image", "text"]
             )
@@ -492,6 +494,69 @@ def post_line(image_bytes: bytes, caption: str) -> bool:
     except Exception as e:
         logger.error(f"LINE投稿エラー: {e}")
         return False
+
+# ════════════════════════════════════════════════════
+#  メディアグループ（複数枚アルバム）まとめて処理
+# ════════════════════════════════════════════════════
+async def _process_media_group_job(context: ContextTypes.DEFAULT_TYPE):
+    """2秒バッファ後に複数写真をまとめてデザイン生成する JobQueue コールバック"""
+    grp_key = context.job.data
+    grp = context.bot_data.pop(grp_key, None)
+    if not grp:
+        return
+
+    chat_id    = grp["chat_id"]
+    message_id = grp["message_id"]
+    photos     = grp["photos"]
+    user_text  = grp.get("user_text", "")
+    parsed     = grp.get("parsed", {})
+
+    await context.bot.send_message(chat_id=chat_id,
+        text=f"🎨 {len(photos)}枚の写真から商品を切り出してデザインし直し中...（少し時間がかかります）")
+
+    platforms     = parsed.get("platforms", ["instagram", "x"])
+    do_add_logo   = parsed.get("add_logo", True)
+    caption_instr = parsed.get("caption_instruction", user_text)
+    image_prompt  = parsed.get("image_prompt", "") or caption_instr
+    schedule_time = parsed.get("schedule_time", "")
+    post_type     = parsed.get("post_type", "single")
+    items         = parsed.get("items", [])
+
+    use_as_is = any(kw in user_text for kw in ("そのまま", "この写真で", "この画像で", "加工なし"))
+    if use_as_is:
+        # 複数枚そのまま → 1枚目をメイン画像として使用
+        image_bytes = photos[0]
+    else:
+        image_bytes = await redesign_product_image(photos, caption_instr)
+        if not image_bytes:
+            await context.bot.send_message(chat_id=chat_id,
+                text="⚠️ デザイン生成に失敗しました。1枚目の写真を使います。")
+            image_bytes = photos[0]
+
+    # ロゴ未登録警告
+    if do_add_logo and not get_logo_paths():
+        await context.bot.send_message(chat_id=chat_id,
+            text="⚠️ ロゴ未登録です。/setlogo でロゴを登録するとすべての投稿に自動でロゴが入ります。")
+
+    await context.bot.send_message(chat_id=chat_id, text="✍️ キャプション生成中...")
+    captions = {p: generate_caption(caption_instr, p, post_type, items) for p in platforms}
+
+    # _send_preview に必要な msg ライクオブジェクトを作成
+    class _FakeMsg:
+        def __init__(self, chat_id, message_id, bot):
+            self.chat_id   = chat_id
+            self.message_id = message_id
+            self._bot      = bot
+        async def reply_text(self, text, **kw):
+            await self._bot.send_message(chat_id=self.chat_id, text=text, **kw)
+        async def reply_photo(self, photo, **kw):
+            await self._bot.send_photo(chat_id=self.chat_id, photo=photo, **kw)
+
+    fake_msg = _FakeMsg(chat_id, message_id, context.bot)
+    await _send_preview(fake_msg, context, image_bytes, captions, platforms,
+                        image_prompt, caption_instr, do_add_logo, schedule_time,
+                        post_type, items)
+
 
 # ════════════════════════════════════════════════════
 #  投稿実行（確認後 / 予約）
@@ -753,21 +818,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 画像取得
     image_bytes = None
 
-    # 写真が添付されている場合 → 学習スタイルでデザインし直す（「そのまま」明示時のみ素材として使用）
+    # 写真が添付されている場合
     if msg.photo:
+        # ── メディアグループ（複数枚アルバム）の場合はバッファに積んで2秒後にまとめて処理 ──
+        if msg.media_group_id:
+            grp_key = f"media_group_{msg.media_group_id}"
+            if grp_key not in context.bot_data:
+                context.bot_data[grp_key] = {
+                    "photos": [], "chat_id": msg.chat_id,
+                    "message_id": msg.message_id, "user_text": user_text,
+                    "parsed": parsed,
+                }
+            file = await msg.photo[-1].get_file()
+            context.bot_data[grp_key]["photos"].append(
+                bytes(await file.download_as_bytearray())
+            )
+            # 2秒後にまとめて処理（タイマーを毎回リセット）
+            job_name = f"process_media_group_{msg.media_group_id}"
+            for job in context.job_queue.get_jobs_by_name(job_name):
+                job.schedule_removal()
+            context.job_queue.run_once(
+                _process_media_group_job,
+                when=2,
+                data=grp_key,
+                name=job_name,
+            )
+            return  # バッファに積んだだけなので終了
+
+        # ── 単体写真 ──
         file = await msg.photo[-1].get_file()
         raw_photo = bytes(await file.download_as_bytearray())
-
         use_as_is = any(kw in user_text for kw in ("そのまま", "この写真で", "この画像で", "加工なし"))
         if use_as_is:
             image_bytes = raw_photo
         else:
             await msg.reply_text("🎨 商品を切り出してデザインし直し中...（少し時間がかかります）")
-            image_bytes = await redesign_product_image(raw_photo, caption_instr)
+            image_bytes = await redesign_product_image([raw_photo], caption_instr)
             if not image_bytes:
                 await msg.reply_text("⚠️ デザイン生成に失敗しました。元の写真を使います。")
                 image_bytes = raw_photo
-            # デザイン生成なのでimage_promptも更新
             if not image_prompt:
                 image_prompt = caption_instr
 
