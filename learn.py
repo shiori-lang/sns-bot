@@ -12,6 +12,8 @@ import re
 import base64
 import asyncio
 import logging
+import tempfile
+import threading
 from pathlib import Path
 
 import requests
@@ -148,36 +150,38 @@ def _prepare_image_for_vision(img_bytes: bytes) -> str:
 # ════════════════════════════════════════════════════
 #  instagrapi でInstagramプロフィールを取得
 # ════════════════════════════════════════════════════
-_ig_client = None  # セッションキャッシュ
+_ig_client = None       # セッションキャッシュ
+_ig_client_lock = threading.Lock()  # 同時ログイン防止
 
 def _get_ig_client():
     """instagrapiクライアントをログイン済み状態で返す（セッション再利用）"""
     global _ig_client
-    if _ig_client:
-        return _ig_client
-    if not (INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD):
-        raise RuntimeError("INSTAGRAM_USERNAME / INSTAGRAM_PASSWORD が未設定です")
+    with _ig_client_lock:
+        if _ig_client:
+            return _ig_client
+        if not (INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD):
+            raise RuntimeError("INSTAGRAM_USERNAME / INSTAGRAM_PASSWORD が未設定です")
 
-    from instagrapi import Client
-    session_path = BASE_DIR / "ig_session.json"
-    cl = Client()
-    if session_path.exists():
-        try:
-            cl.load_settings(session_path)
+        from instagrapi import Client
+        session_path = BASE_DIR / "ig_session.json"
+        cl = Client()
+        if session_path.exists():
+            try:
+                cl.load_settings(session_path)
+                cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+                logger.info("instagrapi: セッション再利用でログイン成功")
+            except Exception as e:
+                logger.warning(f"instagrapi: セッション再利用失敗、再ログイン: {e}")
+                session_path.unlink(missing_ok=True)
+                cl = Client()
+                cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+        else:
             cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-            logger.info("instagrapi: セッション再利用でログイン成功")
-        except Exception as e:
-            logger.warning(f"instagrapi: セッション再利用失敗、再ログイン: {e}")
-            session_path.unlink(missing_ok=True)
-            cl = Client()
-            cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-    else:
-        cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-        logger.info("instagrapi: 新規ログイン成功")
+            logger.info("instagrapi: 新規ログイン成功")
 
-    cl.dump_settings(session_path)
-    _ig_client = cl
-    return cl
+        cl.dump_settings(session_path)
+        _ig_client = cl
+        return cl
 
 
 def fetch_instagram_profile_posts(profile_url: str, max_posts: int = 20) -> list[dict]:
@@ -212,7 +216,7 @@ def fetch_instagram_profile_posts(profile_url: str, max_posts: int = 20) -> list
             # 画像を直接ダウンロード（instagrapi認証済みセッションで取得）
             image_bytes = None
             try:
-                tmp = cl.photo_download_by_pk(media.pk, folder="/tmp")
+                tmp = cl.photo_download_by_pk(media.pk, folder=tempfile.gettempdir())
                 with open(tmp, "rb") as f:
                     image_bytes = f.read()
                 os.unlink(tmp)

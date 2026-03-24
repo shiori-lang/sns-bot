@@ -783,8 +783,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data[f"waiting_schedule_{chat_id}"] = pending_key
         await query.edit_message_text(
             f"📅 投稿する日時を入力してください。{hint}\n"
-            "例: `明日の朝9時` / `3月25日 14:00` / `2026-03-25 09:00`",
-            parse_mode="Markdown"
+            "例: 明日の朝9時 / 3月25日 14:00 / 2026-03-25 09:00"
         )
         return
 
