@@ -157,24 +157,29 @@ def parse_schedule_time(text: str) -> str:
 #  画像処理
 # ════════════════════════════════════════════════════
 def resize_for_platform(image_bytes: bytes, platform: str) -> bytes:
-    """
-    プラットフォームの推奨サイズにリサイズ（フィット＋白パディング）。
-    センタークロップは商品が切れるため、全体を収めて余白を白で埋める方式に変更。
-    """
+    """プラットフォームの推奨サイズにぴったりリサイズ（センタークロップ）"""
     target_w, target_h = PLATFORM_IMAGE_SIZES.get(platform, (1080, 1080))
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    # アスペクト比を保ちつつターゲット内に収まるようリサイズ
-    img.thumbnail((target_w, target_h), Image.LANCZOS)
+    # アスペクト比を保ちながらターゲットサイズを完全に覆うようスケール
+    src_ratio = img.width / img.height
+    tgt_ratio = target_w / target_h
+    if src_ratio > tgt_ratio:
+        # 横長 → 高さ基準でスケール後、横をクロップ
+        new_h = target_h
+        new_w = int(img.width * target_h / img.height)
+    else:
+        # 縦長 → 幅基準でスケール後、縦をクロップ
+        new_w = target_w
+        new_h = int(img.height * target_w / img.width)
 
-    # 白背景キャンバスの中央に配置
-    canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
-    x = (target_w - img.width) // 2
-    y = (target_h - img.height) // 2
-    canvas.paste(img, (x, y))
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    x = (new_w - target_w) // 2
+    y = (new_h - target_h) // 2
+    img = img.crop((x, y, x + target_w, y + target_h))
 
     buf = io.BytesIO()
-    canvas.save(buf, format="JPEG", quality=90)
+    img.save(buf, format="JPEG", quality=90)
     return buf.getvalue()
 
 
