@@ -711,6 +711,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_text("❌ 画像の分析に失敗しました。")
             return
 
+    # ── ロゴ登録待機中のアルバム → 各写真をロゴとして保存（商品投稿フローを通さない）──
+    if msg.photo and msg.media_group_id and context.user_data.get("waiting_logo"):
+        await _save_logo(msg)
+        # 同じアルバムの残り写真も処理できるよう waiting_logo は True のまま維持
+        # ジョブで 2秒後に waiting_logo を解除する
+        job_name = f"clear_waiting_logo_{msg.chat_id}"
+        for job in context.job_queue.get_jobs_by_name(job_name):
+            job.schedule_removal()
+        async def _clear_waiting_logo(ctx: ContextTypes.DEFAULT_TYPE):
+            ctx.job.data["user_data"].pop("waiting_logo", None)
+        context.job_queue.run_once(
+            _clear_waiting_logo, when=3,
+            data={"user_data": context.user_data},
+            name=job_name,
+        )
+        return
+
     # ── メディアグループ（アルバム）は user_text チェックより先に処理 ──────
     # Telegram はアルバムを「1枚ずつの別メッセージ」で送るため、
     # キャプションのない2枚目以降がロゴ登録に誤判定されるのを防ぐ
