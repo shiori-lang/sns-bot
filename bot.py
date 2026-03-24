@@ -849,11 +849,12 @@ async def learn_own_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     await msg.reply_text("📚 自分の投稿を取得・分析中...（少し時間がかかります）")
     try:
-        insta_count, x_count, analysis, warning = await run_learn_own_posts()
+        insta_count, x_count, img_count, analysis, image_analysis, warning = await run_learn_own_posts()
         x_status = f"{x_count}件" if x_count else "⚠️ クレジット不足（後で追加可）"
+        img_status = f"（画像 {img_count}枚 を Vision 分析）" if img_count else "（画像URL取得不可）"
         header = (
             f"✅ 学習完了！\n\n"
-            f"📸 Instagram: {insta_count}件\n"
+            f"📸 Instagram: {insta_count}件 {img_status}\n"
             f"🐦 X: {x_status}"
         )
         if warning == "x_credit":
@@ -863,7 +864,9 @@ async def learn_own_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Xの過去投稿も学習できます。"
             )
         await msg.reply_text(header)
-        await msg.reply_text(f"📊 スタイル分析結果:\n\n{analysis}")
+        if image_analysis:
+            await msg.reply_text(f"🖼 画像スタイル分析:\n\n{image_analysis}")
+        await msg.reply_text(f"📊 総合スタイル分析:\n\n{analysis}")
     except Exception as e:
         logger.error(f"学習エラー: {e}")
         await msg.reply_text(f"❌ エラー: {e}")
@@ -882,11 +885,18 @@ async def learn_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = context.args[0]
     await msg.reply_text(f"🔍 {url} を解析中...")
     try:
-        count, analysis = await run_learn_url(url)
+        count, img_count, image_analysis, analysis = await run_learn_url(url)
         if count == 0:
-            await msg.reply_text("❌ 投稿を取得できませんでした。URLを確認してください。")
+            hint = ""
+            if "instagram.com" in url:
+                hint = "\n\nInstagram はログインが必要なためプロフィールページのスクレイピングができません。\n個別投稿URL（/p/xxxxx）なら取得できる場合があります。"
+            elif "x.com" in url or "twitter.com" in url:
+                hint = "\n\nX はログインが必要なためスクレイピングできません。"
+            await msg.reply_text(f"❌ 投稿を取得できませんでした。{hint}")
             return
-        await msg.reply_text(f"✅ 参考投稿 {count}件 を学習しました！")
+        await msg.reply_text(f"✅ 参考投稿 {count}件 を学習しました！" + (f"（画像 {img_count}枚 を Vision 分析）" if img_count else ""))
+        if image_analysis:
+            await msg.reply_text(f"🖼 画像スタイル分析:\n\n{image_analysis}")
         await msg.reply_text(f"📊 更新されたスタイル分析:\n\n{analysis}")
     except Exception as e:
         logger.error(f"URL学習エラー: {e}")

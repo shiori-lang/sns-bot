@@ -387,7 +387,7 @@ async def run_learn_own_posts() -> tuple[int, int, str, str]:
     guide["style_analysis"] = analysis
     save_style_guide(guide)
 
-    return len(insta_captions), len(x_posts), analysis, warning
+    return len(insta_captions), len(x_posts), len(insta_images), analysis, image_analysis, warning
 
 
 async def run_learn_url(url: str) -> tuple[int, str]:
@@ -437,4 +437,4 @@ async def run_learn_url(url: str) -> tuple[int, str]:
     guide["style_analysis"] = analysis
     save_style_guide(guide)
 
-    return len(posts), analysis
+    return len(posts), len(images), url_image_analysis, analysis
