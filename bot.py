@@ -303,6 +303,51 @@ async def generate_image_gemini(prompt: str) -> bytes | None:
         logger.error(f"Gemini画像生成エラー: {e}")
     return None
 
+async def redesign_product_image(image_bytes: bytes, caption_instr: str) -> bytes | None:
+    """
+    ユーザーが送った写真を受け取り、商品だけを使って学習済みスタイルで
+    SNS投稿用にデザインし直した画像を生成する（Gemini 画像入力→画像出力）。
+    """
+    guide = load_style_guide()
+    image_analysis = guide.get("image_analysis", "")
+    style_section = f"\n【学習済み画像スタイル】\n{image_analysis}\n" if image_analysis else ""
+
+    prompt = (
+        f"以下の写真に写っている商品を使って、スーパー「みどりのマート」のSNS投稿用に"
+        f"プロフェッショナルなデザインの商品画像を新たに生成してください。\n\n"
+        f"要件:\n"
+        f"- 写真から商品だけを切り出し、背景はデザインし直す\n"
+        f"- 魅力的・清潔感があり、購買意欲が高まるビジュアル\n"
+        f"- 価格やテキストは入れない（キャプションで対応）\n"
+        f"- 投稿内容のヒント: {caption_instr}\n"
+        f"{style_section}"
+    )
+
+    try:
+        # PIL Image として読み込んでGeminiに渡す
+        from PIL import Image as PILImage
+        pil_img = PILImage.open(io.BytesIO(image_bytes)).convert("RGB")
+        # 大きすぎると遅いので最大1024pxに縮小してから送る
+        pil_img.thumbnail((1024, 1024), PILImage.LANCZOS)
+
+        model = genai.GenerativeModel("gemini-2.0-flash-exp")
+        response = model.generate_content(
+            [prompt, pil_img],
+            generation_config=genai.GenerationConfig(
+                response_modalities=["image", "text"]
+            )
+        )
+        if not response.candidates:
+            logger.error("Gemini redesign: candidatesが空です")
+            return None
+        for part in response.candidates[0].content.parts:
+            if hasattr(part, "inline_data") and part.inline_data:
+                return base64.b64decode(part.inline_data.data)
+    except Exception as e:
+        logger.error(f"Gemini画像デザイン生成エラー: {e}")
+    return None
+
+
 # ════════════════════════════════════════════════════
 #  Claude でキャプション生成
 # ════════════════════════════════════════════════════
@@ -708,12 +753,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 画像取得
     image_bytes = None
 
-    # 写真が添付されている場合
+    # 写真が添付されている場合 → 学習スタイルでデザインし直す（「そのまま」明示時のみ素材として使用）
     if msg.photo:
         file = await msg.photo[-1].get_file()
-        image_bytes = bytes(await file.download_as_bytearray())
+        raw_photo = bytes(await file.download_as_bytearray())
 
-    # 写真なし＆生成指示あり → Gemini生成
+        use_as_is = any(kw in user_text for kw in ("そのまま", "この写真で", "この画像で", "加工なし"))
+        if use_as_is:
+            image_bytes = raw_photo
+        else:
+            await msg.reply_text("🎨 商品を切り出してデザインし直し中...（少し時間がかかります）")
+            image_bytes = await redesign_product_image(raw_photo, caption_instr)
+            if not image_bytes:
+                await msg.reply_text("⚠️ デザイン生成に失敗しました。元の写真を使います。")
+                image_bytes = raw_photo
+            # デザイン生成なのでimage_promptも更新
+            if not image_prompt:
+                image_prompt = caption_instr
+
+    # 写真なし＆生成指示あり → Geminiでテキストから画像生成
     elif do_generate and image_prompt:
         await msg.reply_text("🎨 Geminiで画像生成中...")
         image_bytes = await generate_image_gemini(image_prompt)
