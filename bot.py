@@ -258,11 +258,21 @@ def add_logo_to_image(image_bytes: bytes) -> bytes:
         return image_bytes
 
 async def generate_image_gemini(prompt: str) -> bytes | None:
-    """Gemini で画像生成"""
+    """Gemini で画像生成（学習済み画像スタイルをプロンプトに反映）"""
+    # 学習済みスタイルを反映
+    guide = load_style_guide()
+    image_analysis = guide.get("image_analysis", "")
+    style_prefix = f"【参考スタイル】{image_analysis}\n\n" if image_analysis else ""
+
+    full_prompt = (
+        f"{style_prefix}"
+        f"スーパー「みどりのマート」のSNS投稿用の魅力的な商品画像を生成してください。\n"
+        f"内容: {prompt}"
+    )
     try:
         model = genai.GenerativeModel("gemini-2.0-flash-exp")
         response = model.generate_content(
-            [f"スーパーのSNS投稿用の魅力的な商品画像を生成: {prompt}"],
+            [full_prompt],
             generation_config=genai.GenerationConfig(
                 response_modalities=["image", "text"]
             )
