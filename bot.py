@@ -295,6 +295,9 @@ async def generate_image_gemini(prompt: str) -> bytes | None:
                 response_modalities=["image", "text"]
             )
         )
+        if not response.candidates:
+            logger.error("Gemini: candidatesが空です")
+            return None
         for part in response.candidates[0].content.parts:
             if hasattr(part, "inline_data") and part.inline_data:
                 return base64.b64decode(part.inline_data.data)
@@ -414,6 +417,9 @@ def post_x(image_bytes: bytes, caption: str) -> bool:
             tmp = f.name
         media = api_v1.media_upload(tmp)
         os.unlink(tmp)
+        if not media or not getattr(media, "media_id", None):
+            logger.error("X: メディアアップロード失敗 - media_id なし")
+            return False
         client = tweepy.Client(consumer_key=X_API_KEY,
                                consumer_secret=X_API_SECRET,
                                access_token=X_ACCESS_TOKEN,
@@ -489,10 +495,19 @@ async def execute_posting(context: ContextTypes.DEFAULT_TYPE,
     captions     = data.get("captions", {})
     platforms    = data.get("platforms", [])
 
+    if not image_bytes and not sized_images:
+        await context.bot.send_message(chat_id=chat_id, text="❌ 画像データが見つかりません。もう一度やり直してください。")
+        context.bot_data.pop(pending_key, None)
+        context.bot_data.pop(f"pending_chat_{chat_id}", None)
+        return
+
     results = []
     for p in platforms:
         caption = captions.get(p, "")
-        sized = sized_images.get(p) or resize_for_platform(image_bytes, p)
+        sized = sized_images.get(p) or (resize_for_platform(image_bytes, p) if image_bytes else None)
+        if not sized:
+            results.append(f"{'📸' if p=='instagram' else '🐦' if p=='x' else '💚'} {p.upper()}: ❌ 画像なし")
+            continue
         if p == "instagram":
             ok = post_instagram(sized, caption)
             results.append(f"📸 Instagram: {'✅ 成功' if ok else '❌ 失敗'}")
@@ -516,7 +531,7 @@ async def execute_posting(context: ContextTypes.DEFAULT_TYPE,
 #  Telegram ハンドラー
 # ════════════════════════════════════════════════════
 async def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
-    if not hasattr(context.bot_data, "_username"):
+    if "_username" not in context.bot_data:
         me = await context.bot.get_me()
         context.bot_data["_username"] = me.username
     return context.bot_data.get("_username", "")
@@ -541,6 +556,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             or (context.user_data.get("learning_images") is not None)
         )
         if not mentioned:
+            return
+
+    # キャンセルワードで全待機状態を解除
+    _cancel_words = ("キャンセル", "cancel", "Cancel", "やめる", "やめて")
+    if (msg.text or "").strip() in _cancel_words:
+        cleared = False
+        if context.user_data.pop("learning_images", None) is not None:
+            context.user_data.pop("learning_label", None)
+            cleared = True
+        if context.user_data.pop("waiting_logo", None):
+            cleared = True
+        if cleared:
+            await msg.reply_text("✅ キャンセルしました。")
             return
 
     # ── /learnimage 画像受け取り中 ──────────────────────────
@@ -803,6 +831,8 @@ JSONのみ返してください:
                 new_image = add_logo_to_image(new_image)
             image_bytes = new_image
             image_prompt = new_prompt
+        else:
+            await msg.reply_text("⚠️ 画像の再生成に失敗しました。元の画像でキャプションのみ更新します。")
 
     # キャプションを修正
     if target in ("caption", "both"):
@@ -829,8 +859,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
+    # callback_data から (chat_id, msg_id) を安全に取り出すヘルパー
+    try:
+        parts = data.split("_", 2)
+        chat_id, msg_id = parts[1], parts[2]
+    except (IndexError, ValueError):
+        logger.error(f"不正なcallback_data: {data}")
+        await query.edit_message_text("❌ 不正なデータです。もう一度やり直してください。")
+        return
+
     if data.startswith("cancel_"):
-        _, chat_id, msg_id = data.split("_", 2)
         pending_key = f"pending_{chat_id}_{msg_id}"
         context.bot_data.pop(pending_key, None)
         context.bot_data.pop(f"pending_chat_{chat_id}", None)
@@ -838,13 +876,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("post_"):
-        _, chat_id, msg_id = data.split("_", 2)
         await query.edit_message_text("⏳ 投稿中...")
         await execute_posting(context, int(chat_id), int(msg_id))
         return
 
     if data.startswith("schedule_"):
-        _, chat_id, msg_id = data.split("_", 2)
         pending_key = f"pending_{chat_id}_{msg_id}"
         pending = context.bot_data.get(pending_key)
         if not pending:
@@ -866,16 +902,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("editimg_"):
-        _, chat_id, msg_id = data.split("_", 2)
         context.bot_data[f"editimg_{chat_id}_{msg_id}"] = True
         await query.edit_message_text(
             "🎨 どう修正しますか？修正内容を送ってください。\n"
-            "例: `もっと明るい雰囲気にして` / `背景を白にして` / `野菜を大きく映して`"
+            "例: もっと明るい雰囲気にして / 背景を白にして / 野菜を大きく映して"
         )
         return
 
     if data.startswith("rewrite_"):
-        _, chat_id, msg_id = data.split("_", 2)
         context.bot_data[f"rewrite_{chat_id}_{msg_id}"] = True
         await query.edit_message_text(
             "📝 新しいキャプション指示を送ってください："
