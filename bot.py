@@ -200,7 +200,6 @@ def find_best_logo_position(base_img: Image.Image, logo_w: int, logo_h: int) -> 
 
     for name, (cx, cy) in corners.items():
         region = gray.crop((cx, cy, cx + logo_w, cy + logo_h))
-        import numpy as np
         arr = list(region.getdata())
         avg = sum(arr) / len(arr) if arr else 128
         # 端に近いほどスコアを下げる（端の方が自然）
@@ -278,7 +277,13 @@ def add_logo_to_image(image_bytes: bytes) -> bytes:
 
 async def generate_image_gemini(prompt: str) -> bytes | None:
     """Gemini で画像生成（学習済み画像スタイルをプロンプトに反映）"""
-    # 学習済みスタイルを反映
+    try:
+        from google import genai as genai_new
+        from google.genai import types as genai_types
+    except ImportError:
+        logger.error("google-genai SDK が未インストールです")
+        return None
+
     guide = load_style_guide()
     image_analysis = guide.get("image_analysis", "")
     style_prefix = f"【参考スタイル】{image_analysis}\n\n" if image_analysis else ""
@@ -289,18 +294,20 @@ async def generate_image_gemini(prompt: str) -> bytes | None:
         f"内容: {prompt}"
     )
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash-exp")
-        response = model.generate_content(
-            [full_prompt],
-            generation_config=genai.GenerationConfig(
-                response_modalities=["image", "text"]
-            )
+        client = genai_new.Client(api_key=GEMINI_API_KEY)
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-2.0-flash-exp",
+            contents=[full_prompt],
+            config=genai_types.GenerateContentConfig(
+                response_modalities=["IMAGE", "TEXT"]
+            ),
         )
         if not response.candidates:
             logger.error("Gemini: candidatesが空です")
             return None
         for part in response.candidates[0].content.parts:
-            if hasattr(part, "inline_data") and part.inline_data:
+            if part.inline_data:
                 return base64.b64decode(part.inline_data.data)
     except Exception as e:
         logger.error(f"Gemini画像生成エラー: {e}")
@@ -309,8 +316,15 @@ async def generate_image_gemini(prompt: str) -> bytes | None:
 async def redesign_product_image(photos: list[bytes], caption_instr: str) -> bytes | None:
     """
     1枚または複数枚の商品写真を受け取り、学習済みスタイルでSNS用にデザインし直す。
-    Gemini の画像入力→画像出力機能を使用。
+    google-genai SDK の画像入力→画像出力機能を使用。
     """
+    try:
+        from google import genai as genai_new
+        from google.genai import types as genai_types
+    except ImportError:
+        logger.error("google-genai SDK が未インストールです")
+        return None
+
     guide = load_style_guide()
     image_analysis = guide.get("image_analysis", "")
     style_section = f"\n【学習済み画像スタイル】\n{image_analysis}\n" if image_analysis else ""
@@ -329,24 +343,32 @@ async def redesign_product_image(photos: list[bytes], caption_instr: str) -> byt
     )
 
     try:
-        pil_imgs = []
-        for b in photos[:4]:  # Gemini の上限を考慮して最大4枚
+        client = genai_new.Client(api_key=GEMINI_API_KEY)
+
+        contents = [prompt]
+        for b in photos[:4]:
             img = Image.open(io.BytesIO(b)).convert("RGB")
             img.thumbnail((1024, 1024), Image.LANCZOS)
-            pil_imgs.append(img)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG")
+            contents.append(genai_types.Part.from_bytes(
+                data=buf.getvalue(), mime_type="image/jpeg"
+            ))
 
-        model = genai.GenerativeModel("gemini-2.0-flash-exp")
-        response = model.generate_content(
-            [prompt] + pil_imgs,
-            generation_config=genai.GenerationConfig(
-                response_modalities=["image", "text"]
-            )
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-2.0-flash-exp",
+            contents=contents,
+            config=genai_types.GenerateContentConfig(
+                response_modalities=["IMAGE", "TEXT"]
+            ),
         )
+
         if not response.candidates:
             logger.error("Gemini redesign: candidatesが空です")
             return None
         for part in response.candidates[0].content.parts:
-            if hasattr(part, "inline_data") and part.inline_data:
+            if part.inline_data:
                 return base64.b64decode(part.inline_data.data)
     except Exception as e:
         logger.error(f"Gemini画像デザイン生成エラー: {e}")
