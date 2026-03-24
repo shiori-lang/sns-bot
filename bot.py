@@ -509,7 +509,15 @@ async def _process_media_group_job(context: ContextTypes.DEFAULT_TYPE):
     message_id = grp["message_id"]
     photos     = grp["photos"]
     user_text  = grp.get("user_text", "")
-    parsed     = grp.get("parsed", {})
+    parsed     = grp.get("parsed") or {}
+
+    # parsed が空（キャプションは最初のメッセージだけに付くため）→ ここで解析
+    if not parsed and user_text:
+        try:
+            parsed = await asyncio.to_thread(parse_instruction, user_text)
+        except Exception as e:
+            logger.error(f"parse_instruction error in media group job: {e}")
+            parsed = {}
 
     await context.bot.send_message(chat_id=chat_id,
         text=f"🎨 {len(photos)}枚の写真から商品を切り出してデザインし直し中...（少し時間がかかります）")
@@ -703,6 +711,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_text("❌ 画像の分析に失敗しました。")
             return
 
+    # ── メディアグループ（アルバム）は user_text チェックより先に処理 ──────
+    # Telegram はアルバムを「1枚ずつの別メッセージ」で送るため、
+    # キャプションのない2枚目以降がロゴ登録に誤判定されるのを防ぐ
+    if msg.photo and msg.media_group_id:
+        grp_key  = f"media_group_{msg.media_group_id}"
+        bot_username_mg = await get_bot_username(context)
+        raw_caption = (msg.caption or "").replace(f"@{bot_username_mg}", "").strip()
+
+        if grp_key not in context.bot_data:
+            context.bot_data[grp_key] = {
+                "photos": [], "chat_id": msg.chat_id,
+                "message_id": msg.message_id,
+                "user_text": raw_caption,
+                "parsed": None,
+            }
+        elif raw_caption:
+            # 後から届いたキャプション付きメッセージで上書き
+            context.bot_data[grp_key]["user_text"] = raw_caption
+
+        file = await msg.photo[-1].get_file()
+        context.bot_data[grp_key]["photos"].append(bytes(await file.download_as_bytearray()))
+
+        job_name = f"process_media_group_{msg.media_group_id}"
+        for job in context.job_queue.get_jobs_by_name(job_name):
+            job.schedule_removal()
+        context.job_queue.run_once(_process_media_group_job, when=2,
+                                   data=grp_key, name=job_name)
+        return  # バッファに積んだだけ
+
     # ロゴ登録待機中なら写真をロゴとして保存
     if context.user_data.get("waiting_logo") and msg.photo:
         context.user_data["waiting_logo"] = False
@@ -818,33 +855,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 画像取得
     image_bytes = None
 
-    # 写真が添付されている場合
+    # 写真が添付されている場合（media_group_id 付きは上で処理済みのため単体写真のみ到達）
     if msg.photo:
-        # ── メディアグループ（複数枚アルバム）の場合はバッファに積んで2秒後にまとめて処理 ──
-        if msg.media_group_id:
-            grp_key = f"media_group_{msg.media_group_id}"
-            if grp_key not in context.bot_data:
-                context.bot_data[grp_key] = {
-                    "photos": [], "chat_id": msg.chat_id,
-                    "message_id": msg.message_id, "user_text": user_text,
-                    "parsed": parsed,
-                }
-            file = await msg.photo[-1].get_file()
-            context.bot_data[grp_key]["photos"].append(
-                bytes(await file.download_as_bytearray())
-            )
-            # 2秒後にまとめて処理（タイマーを毎回リセット）
-            job_name = f"process_media_group_{msg.media_group_id}"
-            for job in context.job_queue.get_jobs_by_name(job_name):
-                job.schedule_removal()
-            context.job_queue.run_once(
-                _process_media_group_job,
-                when=2,
-                data=grp_key,
-                name=job_name,
-            )
-            return  # バッファに積んだだけなので終了
-
         # ── 単体写真 ──
         file = await msg.photo[-1].get_file()
         raw_photo = bytes(await file.download_as_bytearray())
@@ -1106,6 +1118,17 @@ async def set_logo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"現在 {count}/4 枚登録済み。"
         )
 
+async def clear_logos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """登録済みロゴをすべて削除する"""
+    msg = update.message
+    logos = get_logo_paths()
+    if not logos:
+        await msg.reply_text("ロゴは登録されていません。")
+        return
+    for lp in logos:
+        lp.unlink(missing_ok=True)
+    await msg.reply_text(f"🗑 {len(logos)}枚のロゴを削除しました。\n/setlogo で新しいロゴを登録してください。")
+
 def _image_hash(img: Image.Image) -> str:
     """画像を8x8グレースケールに縮小してハッシュ化（重複検出用）"""
     import hashlib
@@ -1257,6 +1280,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setlogo", set_logo))
+    app.add_handler(CommandHandler("clearlogos", clear_logos))
     app.add_handler(CommandHandler("learnposts", learn_own_posts))
     app.add_handler(CommandHandler("learnurl", learn_url))
     app.add_handler(CommandHandler("learnimage", learn_image))
