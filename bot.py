@@ -77,7 +77,7 @@ def parse_instruction(user_text: str) -> dict:
     now_jst = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
     result = claude.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=512,
+        max_tokens=800,
         messages=[{
             "role": "user",
             "content": f"""以下のSNS投稿指示を解析してJSON形式で返してください。
@@ -87,13 +87,31 @@ def parse_instruction(user_text: str) -> dict:
 
 返すJSONの形式:
 {{
-  "platforms": ["instagram", "x", "line"],  // 指定されたSNS（複数可）。「全部」なら3つ全て。未指定なら["instagram","x"]
-  "add_logo": true or false,  // 基本はtrue。「ロゴなし」「ロゴ不要」と明示された場合のみfalse
-  "generate_image": true or false,  // 新しく画像生成が必要か（写真は別途送られてくる場合はfalse）
-  "image_prompt": "",  // 画像生成する場合のプロンプト（日本語）
-  "caption_instruction": "",  // キャプション生成への指示（お題・内容など）
-  "schedule_time": ""  // 予約投稿の場合はISO 8601形式（例: "2026-03-25T09:00:00+09:00"）。今すぐ投稿なら空文字
+  "platforms": ["instagram", "x", "line"],
+  "add_logo": true,
+  "generate_image": true,
+  "image_prompt": "",
+  "caption_instruction": "",
+  "schedule_time": "",
+  "post_type": "single",
+  "items": []
 }}
+
+各フィールドの説明:
+- platforms: 指定されたSNS（複数可）。「全部」なら3つ全て。未指定なら["instagram","x"]
+- add_logo: 基本はtrue。「ロゴなし」「ロゴ不要」と明示された場合のみfalse
+- generate_image: 新しく画像生成が必要か（写真は別途送られてくる場合はfalse）
+- image_prompt: 画像生成する場合のプロンプト（日本語）。複数商品の場合はレイアウトも含めて詳細に
+- caption_instruction: キャプション生成への指示（商品名・価格・セール内容など全情報を含める）
+- schedule_time: 予約投稿の場合はISO 8601形式（例: "2026-03-25T09:00:00+09:00"）。今すぐなら空文字
+- post_type: "single"（単品）/ "set"（セット・まとめ買い割引）/ "before_after"（値下げ前後）/ "multi"（複数商品紹介）
+- items: 商品リスト。例: [{{"name":"りんご","price":"198円","original_price":"","qty":"3個"}}, ...]
+  original_priceは値下げ前の価格（あれば）。セットや複数商品の場合に活用。
+
+複数商品やセット割の場合のimage_promptの書き方：
+- セット：「〇〇と△△を横並びに配置した特売POP風の画像。合計金額□□円を大きく表示。」
+- まとめ買い：「〇〇を複数個並べ、まとめ買い割引□%OFFを強調したレイアウト。」
+- 値下げ：「〇〇の商品写真。価格を大きく、〇〇円→△△円の値下げを視覚的に表現。」
 
 JSONのみ返してください。"""
         }]
@@ -287,7 +305,8 @@ async def generate_image_gemini(prompt: str) -> bytes | None:
 # ════════════════════════════════════════════════════
 #  Claude でキャプション生成
 # ════════════════════════════════════════════════════
-def generate_caption(instruction: str, platform: str) -> str:
+def generate_caption(instruction: str, platform: str,
+                     post_type: str = "single", items: list = None) -> str:
     rules = {
         "instagram": "Instagramらしく絵文字を使い、ハッシュタグ10個程度。200文字以内。",
         "x":         "X(Twitter)用に280文字以内。ハッシュタグ3個以内。",
@@ -310,6 +329,27 @@ def generate_caption(instruction: str, platform: str) -> str:
     if example_text:
         style_section += f"\n【過去の投稿例（このスタイルを参考に）】\n{example_text}\n"
 
+    # 商品情報セクション（複数商品・セット・値下げ対応）
+    items_section = ""
+    if items:
+        type_label = {
+            "set":          "セット・組み合わせ割引",
+            "before_after": "値下げ・タイムセール",
+            "multi":        "複数商品まとめ紹介",
+        }.get(post_type, "商品紹介")
+        lines = []
+        for it in items:
+            name  = it.get("name", "")
+            price = it.get("price", "")
+            orig  = it.get("original_price", "")
+            qty   = it.get("qty", "")
+            line  = name
+            if qty:   line += f" {qty}"
+            if orig:  line += f" {orig}→{price}"
+            elif price: line += f" {price}"
+            lines.append(line)
+        items_section = f"\n【投稿タイプ: {type_label}】\n商品: {' / '.join(lines)}\n"
+
     msg = claude.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=512,
@@ -319,6 +359,7 @@ def generate_caption(instruction: str, platform: str) -> str:
                 f"スーパー「みどりのマート」の{platform}向けキャプションを日本語で作成。\n"
                 f"ルール: {rule}\n"
                 f"{style_section}"
+                f"{items_section}"
                 f"指示: {instruction}\n"
                 f"キャプション本文のみ出力。"
             )
@@ -491,15 +532,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.chat.type in ("group", "supergroup"):
         bot_username = await get_bot_username(context)
         mentioned = (
-            msg.text and f"@{bot_username}" in (msg.text or "")
-        ) or (
-            msg.caption and f"@{bot_username}" in (msg.caption or "")
-        ) or (
-            msg.reply_to_message and
-            msg.reply_to_message.from_user and
-            msg.reply_to_message.from_user.username == bot_username
-        ) or context.user_data.get("waiting_logo")  # /setlogo 待機中
-        or (context.user_data.get("learning_images") is not None)  # /learnimage 待機中
+            (msg.text and f"@{bot_username}" in (msg.text or ""))
+            or (msg.caption and f"@{bot_username}" in (msg.caption or ""))
+            or (msg.reply_to_message
+                and msg.reply_to_message.from_user
+                and msg.reply_to_message.from_user.username == bot_username)
+            or bool(context.user_data.get("waiting_logo"))
+            or (context.user_data.get("learning_images") is not None)
+        )
         if not mentioned:
             return
 
@@ -615,6 +655,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image_prompt     = parsed.get("image_prompt", "")
     caption_instr    = parsed.get("caption_instruction", user_text)
     schedule_time    = parsed.get("schedule_time", "")
+    post_type        = parsed.get("post_type", "single")
+    items            = parsed.get("items", [])
 
     # 画像取得
     image_bytes = None
@@ -651,7 +693,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # キャプション生成
     await msg.reply_text("✍️ キャプション生成中...")
-    captions = {p: generate_caption(caption_instr, p) for p in platforms}
+    captions = {p: generate_caption(caption_instr, p, post_type, items) for p in platforms}
 
     await _send_preview(msg, context, image_bytes, captions, platforms, image_prompt, caption_instr, do_add_logo, schedule_time)
 
