@@ -24,7 +24,7 @@ from telegram.ext import (
 import google.generativeai as genai
 import anthropic
 import tweepy
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from learn import run_learn_own_posts, run_learn_url, run_learn_images, load_style_guide
 
 load_dotenv()
@@ -327,11 +327,11 @@ async def generate_image_gemini(prompt: str) -> bytes | None:
 
     full_prompt = (
         f"{style_prefix}"
-        f"スーパー「みどりのマート」のInstagram投稿用（1:1正方形）の本格的な広告ポスター画像を生成してください。\n"
-        f"スーパーの広告チラシ・ポスター風のグラフィックデザイン。\n"
-        f"日本語キャッチコピー（大きめフォント）と英語サブタイトルを入れ、鮮やかな背景色で商業デザインらしく仕上げる。\n"
-        f"価格・金額の数字は入れない。\n"
-        f"テーマ: {prompt}"
+        f"Abstract background image for a Japanese supermarket SNS poster (1:1 square). "
+        f"Theme: {prompt}. "
+        f"IMPORTANT: NO products, NO food, NO text, NO logos, NO people. "
+        f"ONLY vibrant abstract background with colors, gradients, sparkles, geometric shapes. "
+        f"Commercial-quality graphic design background."
     )
     try:
         client = genai_new.Client(api_key=GEMINI_API_KEY)
@@ -355,110 +355,288 @@ async def generate_image_gemini(prompt: str) -> bytes | None:
         logger.error(f"Gemini画像生成エラー: {e}")
     return None
 
-def _build_gemini_design_prompt(caption_instr: str, n_photos: int, style_section: str) -> str:
+# ════════════════════════════════════════════════════
+#  ポスター画像生成（3ステージパイプライン）
+# ════════════════════════════════════════════════════
+
+def _find_noto_font() -> str | None:
+    """Noto Sans CJK フォントのパスを検索（Railway nixpacks / Ubuntu / macOS 対応）"""
+    candidates = [
+        # nixpacks on Railway (noto-fonts-cjk)
+        "/run/current-system/sw/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
+        "/run/current-system/sw/share/fonts/noto/NotoSansCJKjp-Bold.otf",
+        "/run/current-system/sw/share/fonts/noto/NotoSansCJK-Bold.ttc",
+        "/run/current-system/sw/share/X11/fonts/noto/NotoSansCJK-Bold.ttc",
+        # Ubuntu/Debian
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+        # macOS
+        "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc",
+        "/Library/Fonts/NotoSansCJK-Bold.ttc",
+        # プロジェクト同梱フォント
+        str(BASE_DIR / "fonts" / "NotoSansCJK-Bold.ttc"),
+        str(BASE_DIR / "NotoSansCJK-Bold.ttc"),
+    ]
+    for p in candidates:
+        if Path(p).exists():
+            logger.info(f"Noto font found: {p}")
+            return p
+    # fc-list でフォールバック検索
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["fc-list", ":lang=ja", "--format=%{file}\n"],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            p = line.strip()
+            if p and Path(p).exists():
+                logger.info(f"Noto font via fc-list: {p}")
+                return p
+    except Exception:
+        pass
+    logger.warning("Noto CJK フォントが見つかりません。デフォルトフォントで代替します。")
+    return None
+
+
+def _generate_poster_content(caption_instr: str) -> dict:
     """
-    Claude Haiku でテーマを分析し、Gemini 向けの詳細デザインプロンプト（英語）を生成。
-    背景テーマ・テキスト内容・レイアウトをテーマに合わせて動的に決定する。
+    Claude Haiku でキャッチコピー・サブタイトル・背景テーマを生成。
+    戻り値: {catchcopy, subtitle, bg_prompt}
     """
     try:
         resp = claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=700,
+            max_tokens=300,
             messages=[{"role": "user", "content": f"""
-You are a professional SNS graphic designer for a Japanese supermarket "Midori no Mart".
-Based on the post theme below, write a detailed English image generation prompt for Gemini AI.
+You are designing a Japanese supermarket SNS poster for "Midori no Mart".
 
 Post theme (Japanese): {caption_instr}
-Number of product photos: {n_photos}
 
-The prompt must describe a commercial-quality Japanese supermarket SNS poster (1:1 square) like these styles:
-- Snacks/drinks at night → starry/dark background, warm spotlight on products
-- Limited edition items → bold blue geometric background, stamp/badge design
-- Fruit/fresh items → bright outdoor nature background with fruit elements
-- Valentine/seasonal → thematic color scheme (pink/red/etc), festive decorations
-- Product feature/特集 → sunburst or radial background matching product color
-
-Include all of these in your prompt:
-1. Specific background theme and colors matching the product
-2. Japanese headline text to overlay (3-8 chars catchphrase, bold, large)
-3. English subtitle text (short phrase)
-4. Product layout: {"center hero shot" if n_photos == 1 else f"grid of {n_photos} products, all clearly visible"}
-5. Decorative elements (badges, lines, sparkles, etc.) appropriate to theme
-6. Overall mood and style
-
-{style_section}
-
-Return ONLY the image generation prompt in English. No explanation.
+Return ONLY valid JSON (no markdown) with these fields:
+- "catchcopy": Japanese headline, 4-10 characters, punchy (e.g. "晩酌のおともに", "限定スナック")
+- "subtitle": English subtitle, 2-5 words (e.g. "Perfect Evening Set", "Limited Edition")
+- "bg_prompt": English description for Gemini background generation. Describe ONLY background elements: colors, gradients, patterns, sparkles, geometric shapes. NO products, NO text, NO food items. Example: "Dark navy to deep purple gradient with golden sparkle particles and soft bokeh lights"
 """}]
         )
-        return resp.content[0].text.strip()
+        text = resp.content[0].text.strip()
+        text = re.sub(r"```json|```", "", text).strip()
+        return json.loads(text)
     except Exception as e:
-        logger.error(f"デザインプロンプト生成エラー: {e}")
-        # フォールバック
-        return (
-            f"Professional Japanese supermarket SNS poster (1:1 square) for Midori no Mart. "
-            f"Theme: {caption_instr}. "
-            f"Vibrant commercial advertisement style, bold Japanese headline text, English subtitle, "
-            f"{'center hero product shot' if n_photos == 1 else f'grid layout of {n_photos} products'}. "
-            f"High quality graphic design, purchase-inspiring visuals. No prices."
-        )
+        logger.error(f"ポスターコンテンツ生成エラー: {e}")
+        return {
+            "catchcopy": "本日おすすめ",
+            "subtitle": "Today's Special",
+            "bg_prompt": "Vibrant colorful gradient background with decorative geometric shapes and sparkles",
+        }
 
 
-async def redesign_product_image(photos: list[bytes], caption_instr: str) -> bytes | None:
-    """
-    1枚または複数枚の商品写真を受け取り、学習済みスタイルでSNS用にデザインし直す。
-    Claude Haiku でテーマ分析 → Gemini 画像生成の二段構え。
-    """
+async def _generate_background_only(bg_prompt: str) -> bytes | None:
+    """Gemini で背景のみの画像を生成（商品・テキストなし）"""
     try:
         from google import genai as genai_new
         from google.genai import types as genai_types
     except ImportError:
-        logger.error("google-genai SDK が未インストールです")
         return None
 
-    guide = load_style_guide()
-    image_analysis = guide.get("image_analysis", "")
-    style_section = f"Reference style from past posts: {image_analysis}" if image_analysis else ""
-
-    # Step 1: Claude Haiku でテーマに最適化したデザインプロンプトを生成
-    prompt = await asyncio.to_thread(
-        _build_gemini_design_prompt, caption_instr, len(photos), style_section
+    full_prompt = (
+        f"Abstract background image for a Japanese supermarket poster. "
+        f"IMPORTANT: NO products, NO food, NO text, NO logos, NO people. "
+        f"ONLY abstract background: {bg_prompt}. "
+        f"High quality, commercial poster background, 1:1 square format."
     )
-    logger.info(f"Generated design prompt: {prompt[:200]}")
-
     try:
         client = genai_new.Client(api_key=GEMINI_API_KEY)
-
-        contents = [prompt]
-        for b in photos[:4]:
-            img = Image.open(io.BytesIO(b)).convert("RGB")
-            img.thumbnail((1024, 1024), Image.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG")
-            contents.append(genai_types.Part.from_bytes(
-                data=buf.getvalue(), mime_type="image/jpeg"
-            ))
-
         response = await asyncio.to_thread(
             client.models.generate_content,
             model="gemini-2.5-flash-image",
-            contents=contents,
+            contents=[full_prompt],
             config=genai_types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
                 image_config=genai_types.ImageConfig(aspect_ratio="1:1"),
             ),
         )
-
         if not response.candidates:
-            logger.error("Gemini redesign: candidatesが空です")
             return None
         for part in response.candidates[0].content.parts:
             if part.inline_data:
                 data = part.inline_data.data
                 return data if isinstance(data, bytes) else base64.b64decode(data)
     except Exception as e:
-        logger.error(f"Gemini画像デザイン生成エラー: {e}")
+        logger.error(f"背景生成エラー: {e}")
     return None
+
+
+def _draw_text_centered(
+    draw: "ImageDraw.ImageDraw",
+    text: str,
+    font,
+    canvas_w: int,
+    y: int,
+    fill: tuple,
+    shadow_color: tuple,
+    shadow_offset: int = 3,
+) -> None:
+    """テキストをシャドウ付きで中央揃えに描画"""
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    x = (canvas_w - text_w) // 2
+    draw.text((x + shadow_offset, y + shadow_offset), text, font=font, fill=shadow_color)
+    draw.text((x, y), text, font=font, fill=fill)
+
+
+def _composite_poster(
+    photos: list[bytes],
+    bg_bytes: bytes | None,
+    catchcopy: str,
+    subtitle: str,
+    size: int = 1080,
+) -> bytes:
+    """
+    PIL で商品写真・テキストを合成してポスター画像を生成。
+    - 上62%: 背景 + 商品写真（白カード + ドロップシャドウ）
+    - 下38%: 半透明ダークバンド + 日本語キャッチコピー + 英語サブタイトル
+    """
+    # ── 背景 ──────────────────────────────────────────
+    if bg_bytes:
+        canvas = Image.open(io.BytesIO(bg_bytes)).convert("RGBA").resize(
+            (size, size), Image.LANCZOS
+        )
+    else:
+        # フォールバック: グラデーション背景
+        canvas = Image.new("RGBA", (size, size))
+        draw_bg = ImageDraw.Draw(canvas)
+        for i in range(size):
+            t = i / size
+            r = int(20 + 60 * t)
+            g = int(30 + 40 * t)
+            b = int(80 + 80 * t)
+            draw_bg.line([(0, i), (size, i)], fill=(r, g, b, 255))
+
+    # ── 商品写真グリッド ────────────────────────────────
+    n = len(photos)
+    product_area_h = int(size * 0.62)
+    padding = 20
+    shadow_r = 10
+
+    # 各セルの中心座標 (cx, cy) と最大サイズ (cw, ch)
+    if n == 1:
+        cells = [(size // 2, product_area_h // 2, int(size * 0.55), int(size * 0.55))]
+    elif n == 2:
+        cw = int(size * 0.42)
+        cells = [
+            (size // 4,     product_area_h // 2, cw, cw),
+            (size * 3 // 4, product_area_h // 2, cw, cw),
+        ]
+    elif n == 3:
+        cw = int(size * 0.38)
+        cells = [
+            (size // 4,     int(product_area_h * 0.37), cw, cw),
+            (size * 3 // 4, int(product_area_h * 0.37), cw, cw),
+            (size // 2,     int(product_area_h * 0.78), cw, cw),
+        ]
+    else:  # 4枚
+        cw = int(size * 0.38)
+        cells = [
+            (size // 4,     int(product_area_h * 0.29), cw, cw),
+            (size * 3 // 4, int(product_area_h * 0.29), cw, cw),
+            (size // 4,     int(product_area_h * 0.76), cw, cw),
+            (size * 3 // 4, int(product_area_h * 0.76), cw, cw),
+        ]
+
+    for i, (cx, cy, cw, ch) in enumerate(cells[:n]):
+        try:
+            photo = Image.open(io.BytesIO(photos[i])).convert("RGBA")
+            photo.thumbnail((cw - padding * 2, ch - padding * 2), Image.LANCZOS)
+            pw, ph = photo.size
+
+            # ドロップシャドウ
+            shadow = Image.new("RGBA", (pw + shadow_r * 4, ph + shadow_r * 4), (0, 0, 0, 0))
+            shadow_base = Image.new("RGBA", (pw + shadow_r * 2, ph + shadow_r * 2), (0, 0, 0, 110))
+            shadow.paste(shadow_base, (shadow_r, shadow_r), shadow_base)
+            shadow = shadow.filter(ImageFilter.GaussianBlur(radius=shadow_r))
+            sx = cx - (pw + shadow_r * 4) // 2
+            sy = cy - (ph + shadow_r * 4) // 2
+            canvas.paste(shadow, (sx, sy), shadow)
+
+            # 白カード
+            card_pad = 14
+            card = Image.new("RGBA", (pw + card_pad * 2, ph + card_pad * 2), (255, 255, 255, 245))
+            card_x = cx - (pw + card_pad * 2) // 2
+            card_y = cy - (ph + card_pad * 2) // 2
+            canvas.paste(card, (card_x, card_y), card)
+            canvas.paste(photo, (card_x + card_pad, card_y + card_pad), photo)
+        except Exception as e:
+            logger.error(f"商品写真合成エラー (idx={i}): {e}")
+
+    # ── 下部テキストバンド ─────────────────────────────
+    band_y = int(size * 0.64)
+    band_h = size - band_y
+    band = Image.new("RGBA", (size, band_h), (10, 12, 22, 215))
+    canvas.paste(band, (0, band_y), band)
+
+    # バンド上端の装飾ライン
+    draw = ImageDraw.Draw(canvas)
+    draw.line([(0, band_y), (size, band_y)], fill=(255, 215, 60, 220), width=5)
+
+    # フォント読み込み
+    font_path = _find_noto_font()
+    try:
+        if font_path:
+            font_catch = ImageFont.truetype(font_path, size=int(size * 0.090))
+            font_sub   = ImageFont.truetype(font_path, size=int(size * 0.038))
+        else:
+            font_catch = ImageFont.load_default()
+            font_sub   = ImageFont.load_default()
+    except Exception:
+        font_catch = ImageFont.load_default()
+        font_sub   = ImageFont.load_default()
+
+    # キャッチコピー（白・大・中央）
+    catch_y = band_y + int(band_h * 0.14)
+    _draw_text_centered(draw, catchcopy, font_catch, size, catch_y,
+                        fill=(255, 255, 255, 255), shadow_color=(0, 0, 0, 180))
+
+    # 英語サブタイトル（黄・小・中央）
+    sub_y = band_y + int(band_h * 0.62)
+    _draw_text_centered(draw, subtitle, font_sub, size, sub_y,
+                        fill=(255, 215, 60, 230), shadow_color=(0, 0, 0, 140))
+
+    buf = io.BytesIO()
+    canvas.convert("RGB").save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
+
+
+async def redesign_product_image(photos: list[bytes], caption_instr: str) -> bytes | None:
+    """
+    商品写真 + キャプション指示 → SNS用ポスター画像
+
+    Stage 1: Claude Haiku → catchcopy / subtitle / bg_prompt
+    Stage 2: Gemini      → 背景のみの画像（商品・テキストなし）
+    Stage 3: PIL         → 実際の商品写真を白カードで合成
+    Stage 4: PIL         → 日本語テキストを Noto CJK フォントで描画
+    """
+    # Stage 1
+    content = await asyncio.to_thread(_generate_poster_content, caption_instr)
+    catchcopy = content.get("catchcopy", "本日おすすめ")
+    subtitle  = content.get("subtitle",  "Today's Special")
+    bg_prompt = content.get("bg_prompt", "Colorful vibrant abstract Japanese supermarket background")
+    logger.info(f"Poster: catchcopy={catchcopy!r}, subtitle={subtitle!r}")
+
+    # Stage 2
+    bg_bytes = await _generate_background_only(bg_prompt)
+    if not bg_bytes:
+        logger.warning("背景生成失敗 → グラデーション背景にフォールバック")
+
+    # Stage 3 & 4
+    try:
+        return await asyncio.to_thread(
+            _composite_poster, photos, bg_bytes, catchcopy, subtitle
+        )
+    except Exception as e:
+        logger.error(f"ポスター合成エラー: {e}")
+        return None
 
 
 # ════════════════════════════════════════════════════

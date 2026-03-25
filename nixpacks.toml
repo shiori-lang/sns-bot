@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["python312", "chromium", "nss", "nspr", "atk", "at-spi2-atk", "libdrm", "xorg.libxcb", "libxkbcommon"]
+nixPkgs = ["python312", "chromium", "nss", "nspr", "atk", "at-spi2-atk", "libdrm", "xorg.libxcb", "libxkbcommon", "noto-fonts-cjk"]
 
 [phases.install]
 cmds = [
